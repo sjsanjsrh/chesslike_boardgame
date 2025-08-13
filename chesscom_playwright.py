@@ -12,7 +12,7 @@ from simple_multiprocess import get_multiprocess_move
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
-THINK_TIME = 2.0
+THINK_TIME = 5.0
 FILES = 'abcdefgh'
 VECTOR_COLORS = ["#E91E63", "#B56E3F", "#009688", "#FF9800", "#9C27B0"]
 PIECE_CODES = {
@@ -76,8 +76,7 @@ def load_state_from_chesscom_html(html: str, turn: str = 'w') -> GameState:
     gs.turn = 'w' if turn not in ('w', 'b') else turn
     return gs
 
-
-def _detect_player_color_from_html(html: str) -> str:
+def _board_flipped(html: str) -> bool:
     board_class = None
     m = re.search(r'<wc-chess-board[^>]*\bclass="([^"]*)"', html, flags=re.IGNORECASE)
     if m:
@@ -85,9 +84,8 @@ def _detect_player_color_from_html(html: str) -> str:
     if board_class:
         cls_tokens = board_class.split()
         flipped = ('flipped' in cls_tokens)
-        return 'b' if flipped else 'w'
-    # Fallback: 기본값은 백
-    return 'w'
+        return flipped
+    return False
 
 
 def _sq_to_xy(square: str) -> str:
@@ -197,75 +195,60 @@ def _pl_click_move(page, from_sq: str, to_sq: str, timeout_ms: int = 6000) -> No
 
     board = page.locator('wc-chess-board')
 
-    # 1) Select the piece
-    piece_locators = [
-        board.locator(f'>>> .piece.square-{from_xy}').first,
-        page.locator(f'wc-chess-board >>> .piece.square-{from_xy}').first,
-    ]
-    last_exc = None
-    clicked_piece = False
-    for pl in piece_locators:
+    for attempt in range(3):
+        # 1) Select the piece
+        piece_locators = [
+            board.locator(f'.piece.square-{from_xy}').first,
+            board.locator(f'.square-{from_xy}').first
+        ]
+        last_exc = None
+        clicked_piece = False
+        for pl in piece_locators:
+            try:
+                pl.wait_for(state='attached', timeout=500)
+                pl.click(force=True, timeout=500)
+                clicked_piece = True
+                break
+            except Exception as e:
+                last_exc = e
+                time.sleep(0.1)
+                continue
+
+        # 2) Wait for the piece to be selected (highlight element added)
+        hl = board.locator(f'.highlight.square-{from_xy}')
+        highlighted = False
         try:
-            pl.wait_for(state='visible', timeout=3000)
-            pl.click(force=True, timeout=2000)
-            clicked_piece = True
-            break
-        except Exception as e:
-            last_exc = e
-            continue
+            hl.wait_for(state='attached', timeout=500)
+            highlighted = True
+        except Exception:
+            time.sleep(0.1)
+
     if not clicked_piece:
         raise last_exc or Exception(f"Piece .square-{from_xy} not clickable")
+    if not highlighted:
+        raise Exception(f"Piece .square-{from_xy} not highlighted")
 
-    # 2) Click the destination square (prefer non-piece square element)
-    dest_selectors = [
-        f'>>> [class*="square-{to_xy}"]:not(.piece)',
-        f'>>> .square-{to_xy}',
-    ]
-    containers = [
-        board,
-        page.locator('wc-chess-board'),
-    ]
-    clicked_dest = False
-    for cont in containers:
-        for sel in dest_selectors:
-            try:
-                loc = cont.locator(sel).first
-                try:
-                    loc.wait_for(state='visible', timeout=1500)
-                except Exception:
-                    loc.wait_for(state='attached', timeout=800)
-                loc.click(force=True, timeout=1500)
-                clicked_dest = True
-                break
-            except Exception:
-                continue
-        if clicked_dest:
-            break
-
-    # 3) Fallback to coordinate click on the destination square
-    if not clicked_dest:
-        square_candidates = [
-            board.locator(f'>>> .square-{to_xy}').first,
-            page.locator(f'wc-chess-board >>> .square-{to_xy}').first,
-        ]
-        for sq in square_candidates:
-            try:
-                sq.wait_for(state='visible', timeout=1200)
-                box = sq.bounding_box()
-                if box:
-                    page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
-                    clicked_dest = True
-                    break
-            except Exception:
-                continue
-    if not clicked_dest:
-        raise PWTimeout(f"Could not click destination square {to_sq} (square-{to_xy})")
+    # 3) Select Move Target
+    bbox = board.bounding_box()
+    if not bbox:
+        raise Exception("Could not get board bounding box")
+    board_x, board_y, board_w, board_h = bbox.values()
+    try:
+        to_file = int(to_xy[0])
+        to_rank = int(to_xy[1])
+    except Exception:
+        raise Exception(f"Invalid to_xy: {to_xy}")
+    if _board_flipped(page.content()):
+        to_x = board_x + ((8 - to_file + 0.5) * (board_w / 8))
+        to_y = board_y + ((to_rank - 1 + 0.5) * (board_h / 8))
+    else:
+        to_x = board_x + ((to_file - 1 + 0.5) * (board_w / 8))
+        to_y = board_y + ((8 - to_rank + 0.5) * (board_h / 8))
+    page.mouse.click(to_x, to_y)
 
     # 4) Verify applied: origin piece removed or destination occupied
     def _dest_or_origin_changed() -> bool:
         return page.locator(f'wc-chess-board >>> .piece.square-{to_xy}').count()
-
-
 
     deadline = time.time() + max(0.5, timeout_ms/1000.0)
     while time.time() < deadline:
@@ -641,9 +624,8 @@ def main():
 
             # 초기 상태 출력
             html = page.content()
-            my_color = _detect_player_color_from_html(html)
             fen = parse_chesscom_html_to_fen(html)
-            print('Detected my color:', my_color)
+            my_color = 'w'
             print('FEN(piece placement):', fen)
 
             # 대기/자동응답 루프 (브라우저 닫히면 자동 종료)

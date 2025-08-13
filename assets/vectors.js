@@ -52,8 +52,8 @@
       try{
         var el1 = document.querySelector('wc-chess-board');
         if (el1 && el1.classList && el1.classList.contains('flipped')) return true;
-        var el2 = document.getElementById('board-play-computer');
-        if (el2 && el2.classList && el2.classList.contains('flipped')) return true;
+        // var el2 = document.getElementById('board-play-computer');
+        // if (el2 && el2.classList && el2.classList.contains('flipped')) return true;
       }catch(e){}
       return false;
     }
@@ -78,7 +78,8 @@
           try{
             if (window.injected_overlayCfg && window.injected_overlayCfg.showVectors === false){ clearSvg(); clearLegend(); return true; }
           }catch(e){}
-          var host=document.getElementById('board-play-computer');
+          // var host=document.getElementById('board-play-computer');
+          var host=document.querySelector('wc-chess-board');
           if(!host){ clearSvg(); clearLegend(); return true; }
           var r=host.getBoundingClientRect();
           var svg=ensureSvg(r); clearSvg(); var ns=svg.namespaceURI;
