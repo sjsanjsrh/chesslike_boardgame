@@ -124,11 +124,6 @@ def _register_init_assets(context) -> None:
     context.add_init_script(script=f"(function(){{ try{{ if(!document.getElementById('injected_overlay-style')){{ var s=document.createElement('style'); s.id='injected_overlay-style'; s.textContent={overlay_css!r}; (document.head||document.documentElement).appendChild(s); }} }}catch(e){{}} }})();")
 
 
-def _inject_assets(page, ensure_current: bool = False) -> None:
-    # Deprecated: init scripts are now registered at context-level via _register_init_assets
-    return None
-
-
 def _overlay_set(page, html: str, append: bool = False) -> None:
     page.evaluate(
         "(arg)=>{ if(window.injected_overlayOverlaySet){ return window.injected_overlayOverlaySet(arg.h, arg.a===true); } }",
@@ -156,16 +151,36 @@ def _overlay_is_halt(page) -> bool:
         return False
 
 
-def _overlay_clear_halt_and_auto_off(page) -> None:
-    try:
-        page.evaluate("()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }")
-    except Exception:
-        pass
-
 def _overlay_set_halt(page) -> None:
     """오버레이 Halt를 강제로 켭니다."""
     try:
         page.evaluate("()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: true, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }")
+    except Exception:
+        pass
+
+def _force_halt_reset(page) -> None:
+    """Force-stop UI and reset overlay state immediately while keeping Halt ON."""
+    try:
+        page.evaluate(
+            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: true, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }"
+        )
+    except Exception:
+        pass
+    try:
+        _vector_clear(page)
+    except Exception:
+        pass
+    try:
+        _overlay_set(page, "<div><b>AI</b> <span style='opacity:.85'>halted</span></div>")
+    except Exception:
+        pass
+
+def _overlay_clear_halt_keep_cfg(page) -> None:
+    """Turn off halt without changing other config flags, update badges if available."""
+    try:
+        page.evaluate(
+            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }"
+        )
     except Exception:
         pass
 
@@ -186,7 +201,7 @@ def _vector_clear(page) -> None:
     page.evaluate("()=>{ if(window.injected_overlayVectorClear){ window.injected_overlayVectorClear(); } if(window.injected_overlayVectorLegendClear){ window.injected_overlayVectorLegendClear(); } }")
 
 
-def _pl_click_move(page, from_sq: str, to_sq: str, timeout_ms: int = 6000) -> None:
+def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: int = 6000) -> None:
     """Click a move by selecting a piece and then clicking the destination square directly.
     After clicks, verify the move applied by checking DOM changes (origin piece removed or destination occupied).
     """
@@ -196,6 +211,9 @@ def _pl_click_move(page, from_sq: str, to_sq: str, timeout_ms: int = 6000) -> No
     board = page.locator('wc-chess-board')
 
     for attempt in range(3):
+        if _overlay_is_halt(page):
+            _force_halt_reset(page)
+            raise Exception("halted")
         # 1) Select the piece
         piece_locators = [
             board.locator(f'.piece.square-{from_xy}').first,
@@ -228,7 +246,20 @@ def _pl_click_move(page, from_sq: str, to_sq: str, timeout_ms: int = 6000) -> No
     if not highlighted:
         raise Exception(f"Piece .square-{from_xy} not highlighted")
 
+    # Baseline before applying the move (for robust verification)
+    try:
+        html_before = _get_current_html(page)
+        fen_before = parse_chesscom_html_to_fen(html_before)
+        opp_is_white = (str(my_color).lower().startswith('b'))
+        cnt_opp_before = sum(1 for ch in fen_before if (ch.isupper() if opp_is_white else ch.islower()))
+    except Exception:
+        fen_before = ''
+        cnt_opp_before = -1
+
     # 3) Select Move Target
+    if _overlay_is_halt(page):
+        _force_halt_reset(page)
+        raise Exception("halted")
     bbox = board.bounding_box()
     if not bbox:
         raise Exception("Could not get board bounding box")
@@ -246,14 +277,70 @@ def _pl_click_move(page, from_sq: str, to_sq: str, timeout_ms: int = 6000) -> No
         to_y = board_y + ((8 - to_rank + 0.5) * (board_h / 8))
     page.mouse.click(to_x, to_y)
 
-    # 4) Verify applied: origin piece removed or destination occupied
-    def _dest_or_origin_changed() -> bool:
-        return page.locator(f'wc-chess-board >>> .piece.square-{to_xy}').count()
+    # 4) Verify applied robustly
+    def _origin_empty() -> bool:
+        try:
+            return board.locator(f'.piece.square-{from_xy}').count() == 0
+        except Exception:
+            return False
+
+    def _dest_has_piece() -> bool:
+        try:
+            return board.locator(f'.piece.square-{to_xy}').count() > 0
+        except Exception:
+            return False
+
+    def _stable_fen_pair() -> tuple[str, str]:
+        try:
+            f1 = parse_chesscom_html_to_fen(_get_current_html(page))
+            time.sleep(0.1)
+            f2 = parse_chesscom_html_to_fen(_get_current_html(page))
+            return f1, f2
+        except Exception:
+            return ('', '')
 
     deadline = time.time() + max(0.5, timeout_ms/1000.0)
+    last_seen_fen = fen_before
     while time.time() < deadline:
-        if _dest_or_origin_changed():
-            return
+        if _overlay_is_halt(page):
+            _force_halt_reset(page)
+            raise Exception("halted")
+        # Fast DOM condition: destination has piece and origin is empty
+        if _dest_has_piece() and _origin_empty():
+            f1, f2 = _stable_fen_pair()
+            if f1 and f1 == f2:
+                try:
+                    opp_is_white = (str(my_color).lower().startswith('b'))
+                    cnt_opp_after = sum(1 for ch in f2 if (ch.isupper() if opp_is_white else ch.islower()))
+                    if cnt_opp_before < 0 or cnt_opp_after in (cnt_opp_before, cnt_opp_before - 1):
+                        return
+                except Exception:
+                    return
+
+        # FEN-based condition: changed and stable with valid piece-count delta
+        try:
+            fen_now = parse_chesscom_html_to_fen(_get_current_html(page))
+        except Exception:
+            fen_now = ''
+        if fen_now and fen_now != last_seen_fen:
+            time.sleep(0.1)
+            try:
+                fen_conf = parse_chesscom_html_to_fen(_get_current_html(page))
+            except Exception:
+                fen_conf = ''
+            if fen_conf and fen_conf == fen_now:
+                try:
+                    if cnt_opp_before >= 0:
+                        opp_is_white = (str(my_color).lower().startswith('b'))
+                        cnt_opp_now = sum(1 for ch in fen_now if (ch.isupper() if opp_is_white else ch.islower()))
+                        if cnt_opp_now in (cnt_opp_before, cnt_opp_before - 1):
+                            return
+                    else:
+                        return
+                except Exception:
+                    return
+            last_seen_fen = fen_now
+
         time.sleep(0.06)
     raise PWTimeout(f"Move not applied for {from_sq}->{to_sq} within {timeout_ms}ms")
 
@@ -296,6 +383,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
     def _progress(evt: dict):
         try:
             if _overlay_is_halt(page):
+                _force_halt_reset(page)
                 raise _Cancelled()
             depth = evt.get('depth')
             elapsed = float(evt.get('elapsed') or 0.0)
@@ -389,6 +477,11 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
         except Exception:
             pass
 
+    # Early halt check before any heavy work
+    if _overlay_is_halt(page):
+        _force_halt_reset(page)
+        return False
+
     if (mode or '').lower().startswith('mp'):
         try:
             def _mp_progress(evt: dict):
@@ -401,7 +494,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             move, val, nodes, depth = get_multiprocess_move(gs, think_time, max(1, int(workers or 1)), progress=_mp_progress, top_k=5)
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
-            _overlay_clear_halt_and_auto_off(page)
+            _force_halt_reset(page)
             try:
                 if show_vectors:
                     _vector_clear(page)
@@ -413,7 +506,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                 val, move, nodes, depth = iterative_deepening_search(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
             except _Cancelled:
                 print("[AI] 취소됨(Halt)")
-                _overlay_clear_halt_and_auto_off(page)
+                _force_halt_reset(page)
                 try:
                     if show_vectors:
                         _vector_clear(page)
@@ -425,7 +518,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             val, move, nodes, depth = iterative_deepening_search(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
-            _overlay_clear_halt_and_auto_off(page)
+            _force_halt_reset(page)
             try:
                 if show_vectors:
                     _vector_clear(page)
@@ -477,15 +570,16 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
     try:
         # If halted before clicking, abort
         if _overlay_is_halt(page):
+            _force_halt_reset(page)
             raise _Cancelled()
-        _pl_click_move(page, from_sq, to_sq, timeout_ms=3500)
+        _pl_click_move(page, from_sq, to_sq, my_color, timeout_ms=3500)
     except PWTimeout as e:
         # Not using hint-based clicks anymore; this reflects a generic move click timeout
         print(f"[ui] move click timeout: {e}")
         return False
     except _Cancelled:
         print("[ui] 취소됨(Halt)")
-        _overlay_clear_halt_and_auto_off(page)
+        _force_halt_reset(page)
         try:
             if show_vectors:
                 _vector_clear(page)
@@ -502,16 +596,63 @@ def _get_current_html(page) -> str:
     return page.content()
 
 
-# _safe_goto removed (unused)
+def _navigate_with_fallback(page, url: str, alt_url: Optional[str] = None) -> None:
+    """Navigate to url with tolerant behavior: use 'commit' to avoid hard timeouts,
+    wait for domcontentloaded separately, and optionally try an alternate URL.
+    """
+    alt = alt_url or url.replace('/ko/', '/')
+    tried_alt = False
+    for attempt in range(2):
+        try:
+            page.goto(url if not tried_alt else alt, wait_until='commit', timeout=15000)
+        except Exception:
+            # swallow and try to proceed to load state
+            pass
+        # Try to reach DOMContentLoaded; if it fails, maybe try alt next
+        try:
+            page.wait_for_load_state('domcontentloaded', timeout=20000)
+            return
+        except Exception:
+            if tried_alt:
+                break
+            tried_alt = True
+            continue
+    # Final attempt to at least get something loaded
+    try:
+        page.wait_for_load_state('load', timeout=10000)
+    except Exception:
+        pass
 
 
-def _wait_for_board_change(page, last_fen: str, timeout_s: float = 120.0, poll_s: float = 0.5) -> Tuple[str, str]:
+def _wait_for_board_change(page, last_fen: str, my_color: str, timeout_s: float = 120.0, poll_s: float = 0.5) -> Tuple[str, str]:
+    """Wait for a stable board change. The new FEN must be different from last_fen,
+    appear in two consecutive samples, and have a plausible piece-count delta (0 for quiet, -1 for capture).
+    """
+    def _cnt_opp(f: str) -> int:
+        opp_is_white = (str(my_color).lower().startswith('b'))
+        return sum(1 for ch in f if (ch.isupper() if opp_is_white else ch.islower()))
+
+    last_cnt_opp = _cnt_opp(last_fen)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        html = _get_current_html(page)
-        fen = parse_chesscom_html_to_fen(html)
-        if fen != last_fen:
-            return html, fen
+        if _overlay_is_halt(page):
+            _force_halt_reset(page)
+            raise TimeoutError("halted")
+        html1 = _get_current_html(page)
+        fen1 = parse_chesscom_html_to_fen(html1)
+        if fen1 != last_fen:
+            # debounce/stability check
+            time.sleep(min(0.2, max(0.1, poll_s/2)))
+            html2 = _get_current_html(page)
+            fen2 = parse_chesscom_html_to_fen(html2)
+            if fen2 == fen1:
+                try:
+                    cnt2_opp = _cnt_opp(fen2)
+                    if cnt2_opp in (last_cnt_opp, last_cnt_opp - 1):
+                        return html2, fen2
+                except Exception:
+                    # If counting fails, still accept stable change
+                    return html2, fen2
         time.sleep(poll_s)
     raise TimeoutError("board change wait timeout")
 
@@ -600,13 +741,27 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
         # 루프마다 myColor 최신값 사용
         my_color = 'b' if str(cfg.get('myColor') or '').lower().startswith('b') else 'w'
 
+        # Immediate halt handling:
+        # - If user requested run (thinkOnce) or enabled auto-detect, clear halt and proceed
+        # - Otherwise, keep halted and idle
+        if _overlay_is_halt(page):
+            if think_once or auto_detect_on:
+                _overlay_clear_halt_keep_cfg(page)
+            else:
+                _force_halt_reset(page)
+                time.sleep(poll_s_idle)
+                continue
+
         if think_once:
             _clear_think_once(page)
+            # Ensure halt is off before running once
+            if _overlay_is_halt(page):
+                _overlay_clear_halt_keep_cfg(page)
             html = _get_current_html(page)
             ok = make_ai_move(page, html, my_color, think_time=cur_time, mode=mode, workers=workers, show_vectors=show_vectors)
             if ok:
                 try:
-                    html, last_fen = _wait_for_board_change(page, last_fen, timeout_s=20.0, poll_s=0.2)
+                    html, last_fen = _wait_for_board_change(page, last_fen, my_color, timeout_s=20.0, poll_s=0.2)
                     print("[auto] 내 수 반영됨. FEN:", last_fen)
                     seen_non_empty = (last_fen != empty_fen)
                 except TimeoutError:
@@ -633,10 +788,13 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                 print("[auto] 상대 수 감지. FEN:", fen_now)
                 last_fen = fen_now
                 time.sleep(0.1)
+                # If auto detect is on but halt remains, clear it and proceed
+                if _overlay_is_halt(page):
+                    _overlay_clear_halt_keep_cfg(page)
                 ok = make_ai_move(page, html_now, my_color, think_time=cur_time, mode=mode, workers=workers, show_vectors=show_vectors)
                 if ok:
                     try:
-                        _, last_fen = _wait_for_board_change(page, last_fen, timeout_s=20.0, poll_s=0.2)
+                        _, last_fen = _wait_for_board_change(page, last_fen, my_color, timeout_s=20.0, poll_s=0.2)
                         print("[auto] 응답 수 반영됨. FEN:", last_fen)
                         seen_non_empty = (last_fen != empty_fen)
                     except TimeoutError:
@@ -660,14 +818,16 @@ def main():
             # Register init assets at context-level before creating any pages
             _register_init_assets(context)
             page = context.new_page()
-            page.goto(URL, wait_until='domcontentloaded')
+            # Robust navigation with fallback to non-locale URL
+            _navigate_with_fallback(page, URL, alt_url="https://www.chess.com/play/computer")
             # Page loaded; optional manual ensure hook
             try:
                 page.evaluate("()=>{ if(window.injected_overlayBootstrapEnsure){ window.injected_overlayBootstrapEnsure(); } }")
             except Exception:
                 pass
+            # Try to wait for the board element, but don't crash if missing
             try:
-                page.wait_for_selector('wc-chess-board', timeout=15000)
+                page.wait_for_selector('wc-chess-board', timeout=30000)
             except Exception:
                 pass
 
