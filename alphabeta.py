@@ -645,8 +645,8 @@ def evaluate_position(state: GameState, prev_score: Optional[float] = None) -> f
                 coop_score += (values[target.name]/values[piece.name] if side == 'w' else -values[target.name]/values[piece.name])
         state.turn = orig_turn
     # 가중치
-    score += mobility_score * 0.1
-    score += coop_score * 0.2
+    score += mobility_score * 0.1002
+    score += coop_score * 0.2001
 
     return score
 
@@ -679,24 +679,16 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                pv_move: Optional[Tuple[Tuple[int,int],Tuple[int,int]]] = None,
                deadline: Optional[float] = None,
                budget: Optional[Dict[str, int]] = None):
-    # Cooperative cancellation at safe entry point (time + node budget)
-    # Node-budget accounting: consume a node and cut if over budget
+    # --- 회계/노드 카운트 ---
     if budget is not None:
-        used = budget.get('used', 0) + 1
-        budget['used'] = used
-        limit = budget.get('limit')
-        if limit is not None and used >= limit:
-            raise SearchTimeout()
-        tick = budget.get('tick', 256)
-        if deadline is not None and (used % max(1, int(tick))) == 0:
-            if time.perf_counter() >= deadline:
-                raise SearchTimeout()
+        budget['used'] = budget.get('used', 0) + 1
     nodes += 1
+
+    # --- TT probe ---
     key = state.zobrist_hash()
     tt = trans_table.get(key)
-    # Save original window for bound classification later
     alpha_orig, beta_orig = alpha, beta
-    # TT lookup with bound-aware window tightening
+
     if tt is not None and tt[0] >= depth:
         _, tt_val, tt_bound, tt_bm = tt
         if tt_bound == TT_EXACT:
@@ -708,42 +700,38 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
         if alpha >= beta:
             return tt_val, tt_bm, nodes
 
+    # --- 리프 ---
     if depth == 0:
         score = evaluate_position(state, prev_score)
         trans_table[key] = (depth, score, TT_EXACT, None)
         return score, None, nodes
 
+    # --- 수 생성 ---
     moves = state.generate_all_moves()
 
-    # Terminal node handling: no legal moves
+    # --- 체크메이트/스테일메이트 ---
     if not moves:
-        # Side to move is checkmated or stalemated
         in_check = state.is_in_check(state.turn)
         if in_check:
-            # Mate score from white's perspective; prefer faster mates
-            if state.turn == 'w':
-                # White to move and mated => losing for white
-                val = -MATE_VALUE + ply
-            else:
-                # Black to move and mated => winning for white
-                val = MATE_VALUE - ply
+            val = -MATE_VALUE + ply if state.turn == 'w' else MATE_VALUE - ply
         else:
-            # Stalemate
             val = 0
         trans_table[key] = (depth, val, TT_EXACT, None)
         return val, None, nodes
 
+    # --- 무브 오더링 스코어러 ---
     values = PIECE_VALUES
-
     def score_move(m):
         meta = m[2]
         score = 0.0
-        # PV move 우선
+        # PV 우선
         if pv_move and (m[0], m[1]) == pv_move:
-            score += 1000000
+            score += 1_000_000
+        # TT bestmove
         elif tt and len(tt) >= 4 and tt[3] and (m[0], m[1]) == (tt[3][0], tt[3][1]):
-            score += 900000
-        elif meta.get('capture') or meta.get('en_passant'):
+            score += 900_000
+        # 캡처/앙파상: MVV-LVA
+        elif ('capture' in meta) or ('en_passant' in meta and meta['en_passant']):
             if meta.get('en_passant'):
                 score += 100
             else:
@@ -753,225 +741,233 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     score += values.get(victim.name, 0) * 100
                     if len(m) > 3:
                         score -= values.get(m[3].name, 0)
+        # 킬러
         elif killer_moves is not None and ply < len(killer_moves):
             mk = (m[0], m[1])
             if killer_moves[ply][0] and mk == killer_moves[ply][0]:
                 score += 8000
             elif killer_moves[ply][1] and mk == killer_moves[ply][1]:
                 score += 7000
+        # 히스토리
         if history is not None:
-            keyh = move_key_tuple(m)
-            score += history.get(keyh, 0.0)
+            hk = move_key_tuple(m)
+            score += history.get(hk, 0.0)
+        # 캐슬 가점
         if meta.get('castle'):
             score += 5000
-        return -score
+        return -score  # 오름차순 정렬용
 
     moves.sort(key=score_move)
 
-    # Null Move Pruning
-    if (depth >= 3 and not state.is_in_check(state.turn) and ply > 0):
-        # Null-move pruning: give opponent a free move (toggle side), clear EP
-        null_state = GameState()
-        # Shallow copy board references (piece objects are fine to share)
-        null_state.board = [row[:] for row in state.board]
-        null_state.turn = 'b' if state.turn == 'w' else 'w'
-        null_state.w_king_pos = state.w_king_pos
-        null_state.b_king_pos = state.b_king_pos
-        # Copy castling rights correctly (this engine uses castle_check)
-        try:
-            null_state.castle_check = {
-                'w': state.castle_check['w'][:],
-                'b': state.castle_check['b'][:],
-            }
-        except Exception:
-            pass
-        null_state.en_passant_target = None
-        null_state.halfmove_clock = state.halfmove_clock + 1
-        null_state.fullmove_number = state.fullmove_number + (1 if state.turn == 'b' else 0)
-        reduction = 2
-        child_depth = max(0, depth - 1 - reduction)
-        # Pass correct maximizing flag for side to move in null position
-        try:
-            null_score, _, null_nodes = alpha_beta(
-                null_state, child_depth, alpha, beta,
-                (null_state.turn == 'w'), trans_table,
-                [], 0, ply+1, killer_moves, history,
-                pv_move=None, deadline=deadline, budget=budget
-            )
-        except SearchTimeout:
-            # honor time/budget limits
-            raise
-        nodes += null_nodes
-        # Fail-high -> prune
-        if null_score >= beta:
-            return beta, None, nodes
-
+    # --- 탐색 루프 ---
     best_move = None
+    moves_searched = 0
+
+    # 공통: Futility 여부 판단(현재 노드 기준)
+    node_in_check = state.is_in_check(state.turn)
+    allow_futility = (depth <= 2 and not node_in_check and (beta - alpha) < FUT_WINDOW)
+    static_eval = evaluate_position(state) if allow_futility else None
+
     if maximizing:
         value = -200000
-        # Conservative futility: only at depth-1, not giving check, narrow window
-        allow_futility = (depth == 1 and not state.is_in_check(state.turn) and (beta - alpha) < FUT_WINDOW)
-        static_eval = None
-        if allow_futility:
-            static_eval = evaluate_position(state)
         for i, m in enumerate(moves):
+            meta = m[2]
+            # deadline 체크: 시간 초과 시 현재까지의 결과 반환
             if deadline is not None and time.perf_counter() >= deadline:
-                raise SearchTimeout()
-            # Futility pruning (conservative)
-            if allow_futility and not m[2].get('capture', False):
-                gives_check = state.gives_check(m[0], m[1], m[2])
-                if static_eval + FUT_MAX_GAIN <= alpha:
-                    continue
-            
-            # Guard: skip stale/invalid move if from-square is empty
+                return value, best_move, nodes
+
+            # Futility: 캡처/프로모션/체크 주는 수 제외 후 컷
+            if allow_futility and ('capture' not in meta) and (not meta.get('promotion', False)):
+                if not state.gives_check(m[0], m[1], meta):
+                    if static_eval is not None and static_eval + FUT_MAX_GAIN <= alpha:
+                        continue
+
             fr_r, fr_c = m[0]
             if state.board[fr_r][fr_c] is None:
                 continue
 
-            moving_side = state.turn  # 현재 턴 저장
-            state.apply_move(m[0], m[1], m[2], move_stack)
-            if state.is_in_check(moving_side):  # 변경: move 전의 side로 체크
+            moving_side = state.turn
+            state.apply_move(m[0], m[1], meta, move_stack)
+            if state.is_in_check(moving_side):  # 자체 체크 수 제거
                 state.undo_move(move_stack)
                 continue
-            next_pv = None
-            if i == 0 and pv_move:
-                next_pv = pv_move
-            lmr_threshold = 3
-            lmr_depth_threshold = 3
-            reduction_factor = 1
-            search_depth = depth - 1
-            do_full_search = True
-            if (i >= lmr_threshold and
-                depth >= lmr_depth_threshold and
-                not m[2].get('capture', False) and
-                not m[2].get('promotion', False) and
-                not state.is_in_check(state.turn)):
-                reduced_depth = max(1, search_depth - reduction_factor)
+
+            moves_searched += 1
+
+            # --- 동적 LMR ---
+            do_full = True
+            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False))
+            is_pv = (pv_move is not None and i == 0)
+            if (depth >= 3 and i >= 3 and is_quiet and not node_in_check and not is_pv):
+                red = int(0.75 + math.log(i + 1) * math.log(depth) / 2.25)
+                if red > depth - 1:
+                    red = depth - 1
+                reduced_depth = max(1, depth - 1 - red)
+
                 try:
-                    score, best_mv, lmr_nodes = alpha_beta(state, reduced_depth, alpha, beta, False,
-                                                           trans_table, [], 0, ply+1,
-                                                           killer_moves, history,
-                                                           pv_move=next_pv, deadline=deadline, budget=budget)
+                    score, _, lmr_nodes = alpha_beta(
+                        state, reduced_depth, alpha, beta, False,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=None, deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
-                    # Ensure board is restored before propagating timeout
                     state.undo_move(move_stack)
                     raise
                 nodes += lmr_nodes
-                if score > value:
-                    do_full_search = True
+
+                # LMR 결과가 유망하면 full search
+                if score > alpha:
+                    do_full = True
                 else:
-                    do_full_search = False
-            if do_full_search:
+                    do_full = False
+
+            if do_full:
                 try:
-                    score, best_mv, search_nodes = alpha_beta(state, search_depth, alpha, beta, False, trans_table,
-                                                             [], 0, ply+1, killer_moves, history,
-                                                             pv_move=next_pv, deadline=deadline, budget=budget)
+                    score, _, search_nodes = alpha_beta(
+                        state, depth - 1, alpha, beta, False,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=(pv_move if i == 0 else None),
+                        deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
                 nodes += search_nodes
+
             state.undo_move(move_stack)
+
+            # 알파 갱신
             if score > value:
                 value = score
-                best_move = (m[0], m[1], m[2])
-            alpha = max(alpha, value)
+                best_move = (m[0], m[1], meta)
+            if value > alpha:
+                alpha = value
+
+            # 베타 컷 + 킬러/히스토리 업데이트
             if alpha >= beta:
-                if not m[2].get('capture') and not m[2].get('en_passant') and killer_moves is not None and ply < len(killer_moves):
+                if is_quiet and killer_moves is not None and ply < len(killer_moves):
                     mk = (m[0], m[1])
                     if killer_moves[ply][0] != mk:
                         killer_moves[ply][1] = killer_moves[ply][0]
                         killer_moves[ply][0] = mk
-                if history is not None:
+                if history is not None and is_quiet:
                     hk = move_key_tuple(m)
                     history[hk] = history.get(hk, 0.0) + (depth * depth)
                 break
+
     else:
         value = 200000
-        allow_futility = (depth == 1 and not state.is_in_check(state.turn) and (beta - alpha) < FUT_WINDOW)
-        static_eval = None
-        if allow_futility:
-            static_eval = evaluate_position(state)
         for i, m in enumerate(moves):
+            meta = m[2]
+            # deadline 체크: 시간 초과 시 현재까지의 결과 반환
             if deadline is not None and time.perf_counter() >= deadline:
-                raise SearchTimeout()
-            # Futility pruning (conservative)
-            if allow_futility and not m[2].get('capture', False):
-                gives_check = state.gives_check(m[0], m[1], m[2])
-                if not gives_check and not m[2].get('promotion', False):
-                    if static_eval - FUT_MAX_GAIN >= beta:
+                return value, best_move, nodes
+
+            # Futility (min)
+            if allow_futility and ('capture' not in meta) and (not meta.get('promotion', False)):
+                if not state.gives_check(m[0], m[1], meta):
+                    if static_eval is not None and static_eval - FUT_MAX_GAIN >= beta:
                         continue
-            
-            # Guard: skip stale/invalid move if from-square is empty
+
             fr_r, fr_c = m[0]
             if state.board[fr_r][fr_c] is None:
                 continue
 
-            moving_side = state.turn  # 현재 턴 저장
-            state.apply_move(m[0], m[1], m[2], move_stack)
-            if state.is_in_check(moving_side):  # 변경: move 전의 side로 체크
+            moving_side = state.turn
+            state.apply_move(m[0], m[1], meta, move_stack)
+            if state.is_in_check(moving_side):
                 state.undo_move(move_stack)
                 continue
-            next_pv = None
-            if i == 0 and pv_move:
-                next_pv = pv_move
-            lmr_threshold = 5
-            lmr_depth_threshold = 3
-            reduction_factor = 1
-            search_depth = depth - 1
-            do_full_search = True
-            if (i >= lmr_threshold and
-                depth >= lmr_depth_threshold and
-                not m[2].get('capture', False) and
-                not m[2].get('promotion', False) and
-                not state.is_in_check(state.turn)):
-                reduced_depth = max(1, search_depth - reduction_factor)
+
+            moves_searched += 1
+
+            # --- 동적 LMR ---
+            do_full = True
+            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False))
+            is_pv = (pv_move is not None and i == 0)
+            if (depth >= 3 and i >= 3 and is_quiet and not node_in_check and not is_pv):
+                red = int(0.75 + math.log(i + 1) * math.log(depth) / 2.25)
+                if red > depth - 1:
+                    red = depth - 1
+                reduced_depth = max(1, depth - 1 - red)
+
                 try:
-                    score, best_mv, lmr_nodes = alpha_beta(state, reduced_depth, alpha, beta, True,
-                                                           trans_table, [], 0, ply+1,
-                                                           killer_moves, history,
-                                                           pv_move=next_pv, deadline=deadline, budget=budget)
+                    score, _, lmr_nodes = alpha_beta(
+                        state, reduced_depth, alpha, beta, True,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=None, deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
                 nodes += lmr_nodes
-                if score < value:
-                    do_full_search = True
+
+                # LMR 결과가 유망하면 full search
+                if score < beta:
+                    do_full = True
                 else:
-                    do_full_search = False
-            if do_full_search:
+                    do_full = False
+
+            if do_full:
                 try:
-                    score, best_mv, search_nodes = alpha_beta(state, search_depth, alpha, beta, True, trans_table,
-                                                             [], 0, ply+1, killer_moves, history,
-                                                             pv_move=next_pv, deadline=deadline, budget=budget)
+                    score, _, search_nodes = alpha_beta(
+                        state, depth - 1, alpha, beta, True,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=(pv_move if i == 0 else None),
+                        deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
                 nodes += search_nodes
+
             state.undo_move(move_stack)
+
+            # 베타 갱신
             if score < value:
                 value = score
-                best_move = (m[0], m[1], m[2])
-            beta = min(beta, value)
+                best_move = (m[0], m[1], meta)
+            if value < beta:
+                beta = value
+
+            # 알파베타 컷 + 킬러/히스토리
             if alpha >= beta:
-                if not m[2].get('capture') and not m[2].get('en_passant') and killer_moves is not None and ply < len(killer_moves):
+                if is_quiet and killer_moves is not None and ply < len(killer_moves):
                     mk = (m[0], m[1])
                     if killer_moves[ply][0] != mk:
                         killer_moves[ply][1] = killer_moves[ply][0]
                         killer_moves[ply][0] = mk
-                if history is not None:
+                if history is not None and is_quiet:
                     hk = move_key_tuple(m)
                     history[hk] = history.get(hk, 0.0) + (depth * depth)
                 break
 
-    # Classify bound based on original window
-    if value <= alpha_orig:
+    # --- 모든 수가 잘려 실제 하위 탐색이 없었을 때: TT 오염 방지용 특수 리턴 ---
+    if moves_searched == 0:
+        if state.turn == 'w':
+            return -500000, None, nodes
+        else:
+            return 500000, None, nodes
+
+    # --- TT 저장 (경계 플래그) ---
+    if maximizing:
+        value_final = alpha
+    else:
+        value_final = beta
+
+    if value_final <= alpha_orig:
         bound = TT_UPPER
-    elif value >= beta_orig:
+    elif value_final >= beta_orig:
         bound = TT_LOWER
     else:
         bound = TT_EXACT
-    trans_table[key] = (depth, value, bound, best_move)
-    return value, best_move, nodes
+
+    trans_table[key] = (depth, value_final, bound, (best_move[0], best_move[1]) if best_move else None)
+    return value_final, best_move, nodes
 
 # Iterative Deepening with enhanced features and Aspiration Windows
 def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_depth: int = 4,
@@ -1062,8 +1058,8 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
         try:
             for m in ordered:
                 # Time check before each child
-                if time.perf_counter() >= deadline:
-                    raise SearchTimeout()
+                if deadline is not None and time.perf_counter() >= deadline:
+                    return best_val, best_move, nodes_total, last_completed_depth
 
                 fr, to, meta = m[0], m[1], m[2]
 
