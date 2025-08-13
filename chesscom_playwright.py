@@ -300,6 +300,12 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             nps = (nodes_total/elapsed) if elapsed > 0 else 0.0
             best_move = evt.get('best_move')
             best_val = evt.get('best_val')
+            # Display eval from AI perspective (white+: advantage for AI)
+            try:
+                if isinstance(best_val, (int, float)) and my_color == 'b':
+                    best_val = -float(best_val)
+            except Exception:
+                pass
             remaining = evt.get('remaining')
             try:
                 remaining = float(remaining) if remaining is not None else None
@@ -326,7 +332,17 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             if show_vectors:
                 tm = evt.get('top_moves')
                 if isinstance(tm, list):
-                    _vector_set(page, _build_arrows_from_top_moves(tm))
+                    # Map values to AI perspective for labels
+                    mapped = []
+                    for item in tm:
+                        try:
+                            v = item.get('val')
+                            if isinstance(v, (int, float)) and my_color == 'b':
+                                v = -float(v)
+                            mapped.append({ 'from': item.get('from'), 'to': item.get('to'), 'val': v })
+                        except Exception:
+                            mapped.append(item)
+                    _vector_set(page, _build_arrows_from_top_moves(mapped))
         except _Cancelled:
             raise
         except Exception:
@@ -403,14 +419,16 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
 
     eng_from, eng_to = rc_to_algebraic(fr), rc_to_algebraic(to)
     from_sq, to_sq = _rc_to_ui_algebraic(fr), _rc_to_ui_algebraic(to)
-    print(f"AI Move: engine {eng_from}->{eng_to} | ui {from_sq}->{to_sq} (val={val}, nodes={nodes}, depth={depth})")
+    # display eval from AI perspective
+    disp_val = -val if my_color == 'b' and isinstance(val, (int, float)) else val
+    print(f"AI Move: engine {eng_from}->{eng_to} | ui {from_sq}->{to_sq} (val={disp_val}, nodes={nodes}, depth={depth})")
     try:
         nps_done = (nodes/elapsed) if elapsed > 0 else 0.0
         final_lines = [
             "<div><b>AI</b> <span style='opacity:.85'>done</span></div>",
             f"<div>depth={depth} | elapsed={elapsed:.2f}s | nodes={nodes} | nps={nps_done:.0f}</div>",
             f"<div>pv={from_sq}->{to_sq}</div>",
-            f"<div>eval={val}</div>",
+            f"<div>eval={disp_val}</div>",
         ]
         _overlay_set(page, ''.join(final_lines))
     except Exception:

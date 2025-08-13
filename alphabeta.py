@@ -266,6 +266,35 @@ class GameState:
         
         # Initialize the board with starting position
         self._initialize_board()
+
+    # --- Null move helpers for pruning ---
+    def do_null_move(self, move_stack: list):
+        """Apply a null move (pass turn). Clears en passant as per rules.
+        Records minimal info in move_stack for undo.
+        """
+        undo_rec = {
+            'null_move': True,
+            'prev_en_passant_target': self.en_passant_target,
+        }
+        move_stack.append(undo_rec)
+        # per rules, EP target clears when a side passes a move
+        self.en_passant_target = None
+        # toggle turn and increment move count
+        self.turn = 'b' if self.turn == 'w' else 'w'
+        self.move_count += 1
+
+    def undo_null_move(self, move_stack: list):
+        if not move_stack:
+            return
+        u = move_stack.pop()
+        if not u.get('null_move'):
+            # If last record wasn't a null move, put it back and do nothing
+            move_stack.append(u)
+            return
+        # revert turn and move count
+        self.turn = 'b' if self.turn == 'w' else 'w'
+        self.move_count -= 1
+        self.en_passant_target = u.get('prev_en_passant_target')
     
     def _initialize_board(self):
         """Set up the initial chess board position"""
@@ -665,6 +694,10 @@ TT_UPPER = 'UPPER'  # value is an upper bound (fail-low)
 FUT_MAX_GAIN = PIECE_VALUES.get('Q', 90)  # assume at most queen swing
 FUT_WINDOW = 150  # only apply when window is reasonably narrow (score units)
 
+# Feature flags for pruning modes (tune for performance)
+ENABLE_NULL_MOVE = True  # set True to enable NMP; default off to avoid overhead on this eval
+ENABLE_PVS = True
+
 def move_key_tuple(m):
     # create a hashable key for a move (from,to)
     fr, to = m[0], m[1]
@@ -705,6 +738,44 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
         score = evaluate_position(state, prev_score)
         trans_table[key] = (depth, score, TT_EXACT, None)
         return score, None, nodes
+
+    # --- 기본 상태 ---
+    node_in_check = state.is_in_check(state.turn)
+
+    # --- Null Move Pruning (aggressive, safe-guarded) ---
+    # 조건: 깊이 충분, 체크 아님, 넌-폰 자산 존재
+    def _has_non_pawn_material():
+        for rr in range(8):
+            for cc in range(8):
+                p = state.board[rr][cc]
+                if p is None:
+                    continue
+                if p.name not in ('K', 'P'):
+                    return True
+        return False
+
+    if ENABLE_NULL_MOVE and depth >= 3 and not node_in_check and _has_non_pawn_material():
+        # 선택적 감소치: 깊이에 따라 조금 더 크게
+        R = 2 if depth < 6 else 3
+        nm_stack = []
+        state.do_null_move(nm_stack)
+        try:
+            # null-window search around beta for fail-high detection
+            try_val, _bm, try_nodes = alpha_beta(
+                state, depth - 1 - R, beta - 1, beta, not maximizing,
+                trans_table, [], 0, ply + 1,
+                killer_moves, history,
+                pv_move=None, deadline=deadline, budget=budget
+            )
+        except SearchTimeout:
+            state.undo_null_move(nm_stack)
+            raise
+        finally:
+            state.undo_null_move(nm_stack)
+        nodes += try_nodes
+        # fail-high: prune
+        if try_val >= beta:
+            return try_val, None, nodes
 
     # --- 수 생성 ---
     moves = state.generate_all_moves()
@@ -764,9 +835,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
     moves_searched = 0
 
     # 공통: Futility 여부 판단(현재 노드 기준)
-    node_in_check = state.is_in_check(state.turn)
+    # node_in_check already computed above
     allow_futility = (depth <= 2 and not node_in_check and (beta - alpha) < FUT_WINDOW)
     static_eval = evaluate_position(state) if allow_futility else None
+
+    # Late Move Pruning limits by depth (quiet moves only, not in check)
+    LMP_LIMITS = {1: 6, 2: 10}
 
     if maximizing:
         value = -200000
@@ -789,6 +863,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
             moving_side = state.turn
             state.apply_move(m[0], m[1], meta, move_stack)
             if state.is_in_check(moving_side):  # 자체 체크 수 제거
+                state.undo_move(move_stack)
+                continue
+
+            # Late Move Pruning: skip very late quiet moves at shallow depth
+            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False)) and (not meta.get('castle'))
+            if (depth in LMP_LIMITS) and (not node_in_check) and is_quiet and i >= LMP_LIMITS[depth]:
                 state.undo_move(move_stack)
                 continue
 
@@ -824,17 +904,37 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
 
             if do_full:
                 try:
-                    score, _, search_nodes = alpha_beta(
-                        state, depth - 1, alpha, beta, False,
-                        trans_table, [], 0, ply + 1,
-                        killer_moves, history,
-                        pv_move=(pv_move if i == 0 else None),
-                        deadline=deadline, budget=budget
-                    )
+                    if i == 0 or not ENABLE_PVS:
+                        score, _, search_nodes = alpha_beta(
+                            state, depth - 1, alpha, beta, False,
+                            trans_table, [], 0, ply + 1,
+                            killer_moves, history,
+                            pv_move=(pv_move if i == 0 else None),
+                            deadline=deadline, budget=budget
+                        )
+                        nodes += search_nodes
+                    else:
+                        # PVS: try null-window first
+                        score, _, search_nodes = alpha_beta(
+                            state, depth - 1, alpha, alpha + 1, False,
+                            trans_table, [], 0, ply + 1,
+                            killer_moves, history,
+                            pv_move=None, deadline=deadline, budget=budget
+                        )
+                        nodes += search_nodes
+                        if score > alpha and score < beta:
+                            # re-search with full window
+                            score2, _, add_nodes = alpha_beta(
+                                state, depth - 1, alpha, beta, False,
+                                trans_table, [], 0, ply + 1,
+                                killer_moves, history,
+                                pv_move=None, deadline=deadline, budget=budget
+                            )
+                            nodes += add_nodes
+                            score = score2
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
-                nodes += search_nodes
 
             state.undo_move(move_stack)
 
@@ -881,6 +981,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                 state.undo_move(move_stack)
                 continue
 
+            # Late Move Pruning: skip very late quiet moves at shallow depth
+            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False)) and (not meta.get('castle'))
+            if (depth in LMP_LIMITS) and (not node_in_check) and is_quiet and i >= LMP_LIMITS[depth]:
+                state.undo_move(move_stack)
+                continue
+
             moves_searched += 1
 
             # --- 동적 LMR ---
@@ -913,17 +1019,36 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
 
             if do_full:
                 try:
-                    score, _, search_nodes = alpha_beta(
-                        state, depth - 1, alpha, beta, True,
-                        trans_table, [], 0, ply + 1,
-                        killer_moves, history,
-                        pv_move=(pv_move if i == 0 else None),
-                        deadline=deadline, budget=budget
-                    )
+                    if i == 0 or not ENABLE_PVS:
+                        score, _, search_nodes = alpha_beta(
+                            state, depth - 1, alpha, beta, True,
+                            trans_table, [], 0, ply + 1,
+                            killer_moves, history,
+                            pv_move=(pv_move if i == 0 else None),
+                            deadline=deadline, budget=budget
+                        )
+                        nodes += search_nodes
+                    else:
+                        # PVS for minimizing: try (beta-1, beta) window
+                        score, _, search_nodes = alpha_beta(
+                            state, depth - 1, beta - 1, beta, True,
+                            trans_table, [], 0, ply + 1,
+                            killer_moves, history,
+                            pv_move=None, deadline=deadline, budget=budget
+                        )
+                        nodes += search_nodes
+                        if score < beta and score > alpha:
+                            score2, _, add_nodes = alpha_beta(
+                                state, depth - 1, alpha, beta, True,
+                                trans_table, [], 0, ply + 1,
+                                killer_moves, history,
+                                pv_move=None, deadline=deadline, budget=budget
+                            )
+                            nodes += add_nodes
+                            score = score2
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
-                nodes += search_nodes
 
             state.undo_move(move_stack)
 
@@ -954,14 +1079,11 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
             return 500000, None, nodes
 
     # --- TT 저장 (경계 플래그) ---
-    if maximizing:
-        value_final = alpha
-    else:
-        value_final = beta
+    value_final = value
 
-    if value_final <= alpha_orig:
+    if value <= alpha_orig:
         bound = TT_UPPER
-    elif value_final >= beta_orig:
+    elif value >= beta_orig:
         bound = TT_LOWER
     else:
         bound = TT_EXACT
