@@ -54,7 +54,7 @@
         var cfg = window.injected_overlayCfg || {};
         var dt = (typeof defaultTime==='number' && isFinite(defaultTime) && defaultTime>0)
           ? defaultTime
-          : 5.0;
+          : -1.0;
         // defaults
         var cores = (navigator && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 4;
         function optimalWorkers(n){
