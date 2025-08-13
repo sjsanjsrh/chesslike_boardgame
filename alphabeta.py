@@ -761,8 +761,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
         state.do_null_move(nm_stack)
         try:
             # null-window search around beta for fail-high detection
+            if maximizing:
+                na, nb = (beta - 1, beta)
+            else:
+                na, nb = (alpha, alpha + 1)
             try_val, _bm, try_nodes = alpha_beta(
-                state, depth - 1 - R, beta - 1, beta, not maximizing,
+                state, depth - 1 - R, na, nb, not maximizing,
                 trans_table, [], 0, ply + 1,
                 killer_moves, history,
                 pv_move=None, deadline=deadline, budget=budget
@@ -774,8 +778,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
             state.undo_null_move(nm_stack)
         nodes += try_nodes
         # fail-high: prune
-        if try_val >= beta:
-            return try_val, None, nodes
+        if maximizing:
+            if try_val >= beta:
+                return try_val, None, nodes
+        else:
+            if try_val <= alpha:
+                return try_val, None, nodes
 
     # --- 수 생성 ---
     moves = state.generate_all_moves()
@@ -843,7 +851,7 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
     LMP_LIMITS = {1: 6, 2: 10}
 
     if maximizing:
-        value = -200000
+        value = alpha  # start from current lower bound to avoid sentinel leaks
         for i, m in enumerate(moves):
             meta = m[2]
             # deadline 체크: 시간 초과 시 현재까지의 결과 반환
@@ -958,12 +966,12 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                 break
 
     else:
-        value = 200000
+        value = beta  # start from current upper bound to avoid sentinel leaks
         for i, m in enumerate(moves):
             meta = m[2]
-            # deadline 체크: 시간 초과 시 현재까지의 결과 반환
-            if deadline is not None and time.perf_counter() >= deadline:
-                return value, best_move, nodes
+            # # deadline 체크: 시간 초과 시 현재까지의 결과 반환
+            # if deadline is not None and time.perf_counter() >= deadline:
+            #     return value, best_move, nodes
 
             # Futility (min)
             if allow_futility and ('capture' not in meta) and (not meta.get('promotion', False)):
@@ -1071,12 +1079,11 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     history[hk] = history.get(hk, 0.0) + (depth * depth)
                 break
 
-    # --- 모든 수가 잘려 실제 하위 탐색이 없었을 때: TT 오염 방지용 특수 리턴 ---
+    # --- 모든 수가 잘려 실제 하위 탐색이 없었을 때: 값 역류 방지용 리턴 ---
+    # 모든 수가 LMP/Futility 등으로 컷되어 실제 탐색을 수행하지 않았다면,
+    # 센티넬 값 대신 현재 창 경계를 반환해 상위에서 창이 확장되지 않도록 한다.
     if moves_searched == 0:
-        if state.turn == 'w':
-            return -500000, None, nodes
-        else:
-            return 500000, None, nodes
+        return (alpha if maximizing else beta), None, nodes
 
     # --- TT 저장 (경계 플래그) ---
     value_final = value
@@ -1181,6 +1188,9 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
             for m in ordered:
                 # Time check before each child
                 if deadline is not None and time.perf_counter() >= deadline:
+                    # Prefer current-iteration partial best if available
+                    if local_best_move is not None:
+                        return local_best_val, local_best_move, nodes_total, last_completed_depth
                     return best_val, best_move, nodes_total, last_completed_depth
 
                 fr, to, meta = m[0], m[1], m[2]
@@ -1285,6 +1295,10 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                     pass
 
         except SearchTimeout:
+            # On timeout, prefer current iteration partial best move/value if any
+            if local_best_move is not None:
+                best_move = local_best_move
+                best_val = local_best_val
             # Partial results: emit timeout + depth_complete with what we have
             if callable(progress):
                 try:
@@ -1300,7 +1314,14 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                         for (mm, vv, _nn) in sorted_partial
                     ]
                     last_top_moves = top_moves
-                    progress({'event': 'timeout', 'depth': depth, 'reason': reason, 'top_moves': top_moves})
+                    progress({
+                        'event': 'timeout',
+                        'depth': depth,
+                        'reason': reason,
+                        'best_move': best_move,
+                        'best_val': best_val,
+                        'top_moves': top_moves
+                    })
                 except Exception:
                     pass
             break

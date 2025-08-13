@@ -290,6 +290,9 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
     class _Cancelled(Exception):
         pass
 
+    # cache last seen best to show on UI even if current event lacks best_move
+    _last_best = { 'move': None, 'val': None }
+
     def _progress(evt: dict):
         try:
             if _overlay_is_halt(page):
@@ -304,6 +307,12 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             try:
                 if isinstance(best_val, (int, float)) and my_color == 'b':
                     best_val = -float(best_val)
+                # Avoid showing bound-like huge numbers (e.g., 190000+)
+                if isinstance(best_val, (int, float)) and abs(best_val) >= 190000:
+                    # fallback to last cached value if any
+                    lv = _last_best.get('val')
+                    if isinstance(lv, (int, float)):
+                        best_val = lv
             except Exception:
                 pass
             remaining = evt.get('remaining')
@@ -318,11 +327,30 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             parts = [f"depth={depth}", f"elapsed={elapsed:.2f}s", f"nodes={nodes_total}", f"nps={nps:.0f}"]
             lines = [f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div>", f"<div>{' | '.join(parts)}</div>"]
             if best_move:
+                # update cache
+                try:
+                    _last_best['move'] = best_move
+                    _last_best['val'] = best_val
+                except Exception:
+                    pass
                 fr_ui = _rc_to_ui_algebraic(best_move[0])
                 to_ui = _rc_to_ui_algebraic(best_move[1])
                 lines.append(f"<div>pv={fr_ui}->{to_ui}</div>")
                 if best_val is not None:
                     lines.append(f"<div>eval={best_val}</div>")
+            else:
+                # fallback display using cached best
+                lb = _last_best.get('move')
+                lb_val = _last_best.get('val')
+                try:
+                    if lb:
+                        fr_ui = _rc_to_ui_algebraic(lb[0])
+                        to_ui = _rc_to_ui_algebraic(lb[1])
+                        lines.append(f"<div>pv={fr_ui}->{to_ui}</div>")
+                        if isinstance(lb_val, (int, float)):
+                            lines.append(f"<div>eval={lb_val}</div>")
+                except Exception:
+                    pass
             if think_time and think_time > 0:
                 bar = ("<div style='margin-top:6px;height:8px;background:#333;border-radius:4px;overflow:hidden;'>"
                        f"<div style='height:100%;width:{pct:.1f}%;background:#4CAF50;'></div></div>")
@@ -331,7 +359,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
 
             if show_vectors:
                 tm = evt.get('top_moves')
-                if isinstance(tm, list):
+                if isinstance(tm, list) and len(tm) > 0:
                     # Map values to AI perspective for labels
                     mapped = []
                     for item in tm:
@@ -343,6 +371,19 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                         except Exception:
                             mapped.append(item)
                     _vector_set(page, _build_arrows_from_top_moves(mapped))
+                else:
+                    # fallback: draw cached best
+                    lb = _last_best.get('move')
+                    lb_val = _last_best.get('val')
+                    if lb:
+                        try:
+                            v = lb_val
+                            if isinstance(v, (int, float)) and my_color == 'b':
+                                v = -float(v)
+                            mapped = [{ 'from': lb[0], 'to': lb[1], 'val': v }]
+                            _vector_set(page, _build_arrows_from_top_moves(mapped))
+                        except Exception:
+                            pass
         except _Cancelled:
             raise
         except Exception:
