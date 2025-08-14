@@ -562,7 +562,7 @@ def _analysis_job_entry(job: dict, out_q) -> None:
         import time as _time
         from alphabeta import iterative_deepening_search as _ids
         from simple_multiprocess import get_multiprocess_move as _mp_get
-        # Set engine flags if provided
+    # Set engine flags if provided
         try:
             import alphabeta as _ab
             po = job.get('prevent_overrun')
@@ -583,6 +583,16 @@ def _analysis_job_entry(job: dict, out_q) -> None:
 
         gs = load_state_from_chesscom_html(html, turn=my_color)
         start_ts = _time.time()
+
+        # Determine actual search mode used (mp vs seq or seq-fallback inside subprocess)
+        mode_used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
+        try:
+            import multiprocessing as _mp
+            # If we're in a child process and user requested mp, child mp will fallback to seq
+            if (mode_used == 'mp') and getattr(_mp.current_process(), 'name', '') != 'MainProcess':
+                mode_used = 'seq-fallback'
+        except Exception:
+            pass
 
         def _progress(evt: dict):
             # Massage values for AI perspective (white positive)
@@ -611,7 +621,7 @@ def _analysis_job_entry(job: dict, out_q) -> None:
                 pass
             try:
                 out_q.put_nowait({'type': 'progress', 'evt': e, 'cfg': {
-                    'mode': mode, 'think_time': think_time, 'workers': workers, 'my_color': my_color
+                    'mode': mode, 'mode_used': mode_used, 'think_time': think_time, 'workers': workers, 'my_color': my_color
                 }})
             except Exception:
                 pass
@@ -630,7 +640,7 @@ def _analysis_job_entry(job: dict, out_q) -> None:
 
         elapsed = max(0.0, _time.time() - start_ts)
         try:
-            out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click}})
+            out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click, 'mode': mode, 'mode_used': mode_used, 'think_time': think_time, 'workers': workers}})
         except Exception:
             pass
     except Exception as e:
@@ -650,6 +660,8 @@ class AnalysisWorker:
         self._in_q: "queue.Queue[dict]" = queue.Queue()
         self._out_q: "queue.Queue[dict]" = queue.Queue()
         self._thr: Optional[threading.Thread] = None
+        # Thread handle for in-process MP analysis (created in main process)
+        self._job_thr: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._job_guard = threading.Lock()
         self._proc: Optional[mp.Process] = None
@@ -685,6 +697,7 @@ class AnalysisWorker:
 
     def kill_current(self) -> None:
         """Force-terminate the currently running analysis process (if any)."""
+        # Try process-first
         proc = self._proc
         self._proc = None
         try:
@@ -707,7 +720,10 @@ class AnalysisWorker:
                     pass
         finally:
             self._mp_out_q = None
-        # Notify UI as cancelled
+        # Then thread job (mp-in-main-process path). We cannot force-kill threads; best-effort cancel.
+        t = self._job_thr
+        self._job_thr = None
+        # Notify UI as cancelled (even if underlying computation finishes later)
         try:
             self._out_q.put_nowait({'type': 'cancelled'})
         except Exception:
@@ -755,57 +771,73 @@ class AnalysisWorker:
                 'root_early_abort': item.get('root_early_abort'),
             }
 
-            # Start subprocess and pump messages to _out_q
-            try:
-                self.kill_current()
-            except Exception:
-                pass
-            self._mp_out_q = mp.Queue()
-            self._proc = mp.Process(target=_analysis_job_entry, args=(job, self._mp_out_q))
-            self._proc.daemon = True
-            self._proc.start()
-
-            # Pump messages until process exits and queue is drained
-            proc = self._proc
-            mp_q = self._mp_out_q
-            while proc is not None and proc.is_alive():
-                if self._stop.is_set():
-                    try:
-                        self.kill_current()
-                    except Exception:
-                        pass
-                    break
+            # If requested mode is mp, run analysis in a thread so that any
+            # internal process pools are created in the main process.
+            if str(job.get('mode') or '').lower().startswith('mp'):
+                # Stop any previous job
                 try:
-                    ev = mp_q.get(timeout=0.2)
-                    if ev:
-                        self._out_q.put_nowait(ev)
-                        if ev.get('type') in ('result', 'error'):
-                            # Wait a short moment for any remaining progress then exit
-                            time.sleep(0.05)
-                            break
+                    self.kill_current()
                 except Exception:
                     pass
-            # Drain any remaining messages
-            try:
-                while True:
-                    ev = mp_q.get_nowait()
-                    if ev:
-                        self._out_q.put_nowait(ev)
-            except Exception:
-                pass
-            # Join and cleanup
-            try:
-                if proc is not None:
-                    proc.join(timeout=0.5)
-            except Exception:
-                pass
-            try:
-                if mp_q is not None:
-                    mp_q.close()
-            except Exception:
-                pass
-            self._proc = None
-            self._mp_out_q = None
+                t = threading.Thread(target=_analysis_job_entry, args=(job, self._out_q), daemon=True)
+                self._job_thr = t
+                t.start()
+                # Wait until the analysis thread finishes or worker is stopped
+                while t.is_alive() and not self._stop.is_set():
+                    time.sleep(0.1)
+                self._job_thr = None
+                continue
+            else:
+                # Legacy: run in a subprocess for seq mode to allow force-terminate
+                try:
+                    self.kill_current()
+                except Exception:
+                    pass
+                self._mp_out_q = mp.Queue()
+                self._proc = mp.Process(target=_analysis_job_entry, args=(job, self._mp_out_q))
+                self._proc.daemon = True
+                self._proc.start()
+
+                # Pump messages until process exits and queue is drained
+                proc = self._proc
+                mp_q = self._mp_out_q
+                while proc is not None and proc.is_alive():
+                    if self._stop.is_set():
+                        try:
+                            self.kill_current()
+                        except Exception:
+                            pass
+                        break
+                    try:
+                        ev = mp_q.get(timeout=0.2)
+                        if ev:
+                            self._out_q.put_nowait(ev)
+                            if ev.get('type') in ('result', 'error'):
+                                time.sleep(0.05)
+                                break
+                    except Exception:
+                        pass
+                # Drain any remaining messages
+                try:
+                    while True:
+                        ev = mp_q.get_nowait()
+                        if ev:
+                            self._out_q.put_nowait(ev)
+                except Exception:
+                    pass
+                # Join and cleanup
+                try:
+                    if proc is not None:
+                        proc.join(timeout=0.5)
+                except Exception:
+                    pass
+                try:
+                    if mp_q is not None:
+                        mp_q.close()
+                except Exception:
+                    pass
+                self._proc = None
+                self._mp_out_q = None
 
 
 def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME, mode: str = 'seq', workers: int = 4, show_vectors: bool = True) -> bool:
@@ -849,7 +881,8 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             used = max(0.0, min(think_time, (think_time - remaining) if remaining is not None else elapsed))
             pct = (used/think_time*100.0) if think_time > 0 else 0.0
 
-            cfg_label = f"mode={mode} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+            used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
+            cfg_label = f"mode={mode} | used={used} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
             parts = [f"depth={depth}", f"elapsed={elapsed:.2f}s", f"nodes={nodes_total}", f"nps={nps:.0f}"]
             lines = [f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div>", f"<div>{' | '.join(parts)}</div>"]
             if best_move:
@@ -996,8 +1029,10 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
     print(f"AI Move: engine {eng_from}->{eng_to} | ui {from_sq}->{to_sq} (val={disp_val}, nodes={nodes}, depth={depth})")
     try:
         nps_done = (nodes/elapsed) if elapsed > 0 else 0.0
+        used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
         final_lines = [
             "<div><b>AI</b> <span style='opacity:.85'>done</span></div>",
+            f"<div>mode={mode} | used={used} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '') + "</div>",
             f"<div>depth={depth} | elapsed={elapsed:.2f}s | nodes={nodes} | nps={nps_done:.0f}</div>",
             f"<div>pv={from_sq}->{to_sq}</div>",
             f"<div>eval={disp_val}</div>",
@@ -1297,7 +1332,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                         workers_v = int(cfg_view.get('workers') or 4)
                         myc = str(cfg_view.get('my_color') or my_color)
                         used = min(think_t, elapsed); pct = (used/think_t*100.0) if think_t>0 else 0.0
-                        cfg_label = f"mode={mode_v} | time={think_t:.1f}s" + (f" | workers={workers_v}" if mode_v.lower().startswith('mp') else '')
+                        used_v = str(cfg_view.get('mode_used') or ('mp' if mode_v.lower().startswith('mp') else 'seq'))
+                        cfg_label = f"mode={mode_v} | used={used_v} | time={think_t:.1f}s" + (f" | workers={workers_v}" if mode_v.lower().startswith('mp') else '')
                         parts = [f"depth={depth}", f"elapsed={elapsed:.2f}s", f"nodes={nodes_total}", f"nps={nps:.0f}"]
                         lines = [f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div>", f"<div>{' | '.join(parts)}</div>"]
                         if best_move:
@@ -1325,8 +1361,10 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                         if res_move:
                             fr_ui = _rc_to_ui_algebraic(res_move[0]); to_ui = _rc_to_ui_algebraic(res_move[1])
                             disp_val = -val if (cfg_res.get('my_color') == 'b' and isinstance(val, (int, float))) else val
+                            mode_v = str(cfg_res.get('mode') or 'seq'); used_v = str(cfg_res.get('mode_used') or ('mp' if mode_v.lower().startswith('mp') else 'seq'))
                             final_lines = [
                                 "<div><b>AI</b> <span style='opacity:.85'>done</span></div>",
+                                f"<div>mode={mode_v} | used={used_v} | time={float(cfg_res.get('think_time') or THINK_TIME):.1f}s" + (f" | workers={int(cfg_res.get('workers') or 4)}" if mode_v.lower().startswith('mp') else '') + "</div>",
                                 f"<div>depth={depth} | elapsed={elapsed:.2f}s | nodes={nodes} | nps={nps_done:.0f}</div>",
                                 f"<div>pv={fr_ui}->{to_ui}</div>",
                                 f"<div>eval={disp_val}</div>",
