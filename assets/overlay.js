@@ -204,6 +204,34 @@
   // Keep overlay clickability and stacking
       window.injected_overlayClickabilityKeepAlive = window.injected_overlayClickabilityKeepAlive || (function(){
         var tid = null;
+        function constrainOverlayWidthToAvoidBoard(){
+          try{
+            var root = document.getElementById('injected_overlay-root');
+            if(!root) return;
+            // Anchor top-right consistently
+            var margin = 12;
+            root.style.position = 'fixed';
+            root.style.top = margin + 'px';
+            root.style.right = margin + 'px';
+            root.style.left = '';
+
+            var board = document.querySelector('wc-chess-board');
+            var boardRect = board ? board.getBoundingClientRect() : null;
+            var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+            // Available gap between board's right edge and viewport right (minus margins)
+            var gapRight = (boardRect ? (vw - margin - boardRect.right) : (vw - margin));
+            var allowed = Math.max(0, Math.floor(gapRight - margin));
+
+            // Override min/max widths so we can shrink without overlapping the board
+            var cfg = document.getElementById('injected_overlay-config');
+            var log = document.getElementById('injected_overlay-log');
+            var px = (allowed > 0 ? allowed : 0);
+            // Apply to root (max width only), and inner panels (min reset + max)
+            root.style.maxWidth = px ? (px + 'px') : '';
+            if (cfg){ cfg.style.minWidth = '0px'; cfg.style.maxWidth = px ? (px + 'px') : ''; }
+            if (log){ log.style.minWidth = '0px'; log.style.maxWidth = px ? (px + 'px') : ''; }
+          }catch(e){}
+        }
         function tick(){
           try{
             var r = document.getElementById('injected_overlay-root');
@@ -224,6 +252,7 @@
             if (colorBadge){ colorBadge.style.pointerEvents='auto'; colorBadge.style.zIndex='5'; }
             var legend = document.getElementById('injected_overlay-vector-legend');
             if (legend){ legend.style.pointerEvents='none'; legend.style.zIndex='1'; }
+            constrainOverlayWidthToAvoidBoard();
           }catch(e){}
         }
         if (!tid){ tick(); tid = window.setInterval(tick, 500); }
