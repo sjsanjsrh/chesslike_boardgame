@@ -736,7 +736,7 @@ def evaluate_position(state: GameState, prev_score: Optional[float] = None) -> f
             target = state.board[m[1][0]][m[1][1]]
             if target is None:
                 continue
-            if target.side != side and target.name != 'k':
+            if target.side != side and target.name != 'K':
                 coop_score += (values[target.name]/values[piece.name] if side == 'w' else -values[target.name]/values[piece.name])
         state.turn = orig_turn
     # 가중치
