@@ -702,48 +702,216 @@ class GameState:
             return True
 
         return False
+
+# Bitboard-based fast evaluation
 # ---------------------
-# Improved evaluation
-# ---------------------
-def evaluate_position(state: GameState, prev_score: Optional[float] = None) -> float:
-    values = PIECE_VALUES
-    score = 0
-    exist = 0
-    # Material
+
+# Square helpers (A1=0 .. H8=63)
+def _sq_index(r: int, c: int) -> int:
+    # internal rows: 0(top, rank8) .. 7(bottom, rank1) → map to A1=0 origin
+    return (7 - r) * 8 + c
+
+FILE_A = 0x0101010101010101
+FILE_H = 0x8080808080808080
+
+# Precompute non-sliding attacks
+_KNIGHT_ATTACKS: List[int] = [0]*64
+_KING_ATTACKS: List[int] = [0]*64
+_W_PAWN_ATTACKS: List[int] = [0]*64
+_B_PAWN_ATTACKS: List[int] = [0]*64
+
+def _init_attack_masks():
+    def inside(rc):
+        return 0 <= rc[0] < 8 and 0 <= rc[1] < 8
+    for r in range(8):
+        for c in range(8):
+            idx = _sq_index(r, c)
+            # King
+            km = 0
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    rr, cc = r+dr, c+dc
+                    if 0 <= rr < 8 and 0 <= cc < 8:
+                        km |= (1 << _sq_index(rr, cc))
+            _KING_ATTACKS[idx] = km
+            # Knight
+            nm = 0
+            for dr, dc in ((2,1),(1,2),(-1,2),(-2,1),(-2,-1),(-1,-2),(1,-2),(2,-1)):
+                rr, cc = r+dr, c+dc
+                if 0 <= rr < 8 and 0 <= cc < 8:
+                    nm |= (1 << _sq_index(rr, cc))
+            _KNIGHT_ATTACKS[idx] = nm
+            # Pawn attacks
+            # White: to higher ranks (r-1)
+            wp = 0
+            if r > 0:
+                if c > 0:
+                    wp |= (1 << _sq_index(r-1, c-1))
+                if c < 7:
+                    wp |= (1 << _sq_index(r-1, c+1))
+            _W_PAWN_ATTACKS[idx] = wp
+            bp = 0
+            if r < 7:
+                if c > 0:
+                    bp |= (1 << _sq_index(r+1, c-1))
+                if c < 7:
+                    bp |= (1 << _sq_index(r+1, c+1))
+            _B_PAWN_ATTACKS[idx] = bp
+
+_init_attack_masks()
+
+def _pop_lsb(bb: int) -> Tuple[int, int]:
+    lsb = bb & -bb
+    idx = (lsb.bit_length() - 1)
+    return idx, bb ^ lsb
+
+def _build_bitboards(state: GameState) -> Dict[str, int]:
+    bb = {
+        'WP':0,'WN':0,'WB':0,'WR':0,'WQ':0,'WK':0,
+        'BP':0,'BN':0,'BB':0,'BR':0,'BQ':0,'BK':0,
+    }
     for r in range(8):
         for c in range(8):
             p = state.board[r][c]
-            if p:
-                val = values[p.name]
-                score += val if p.side == 'w' else -val
-                if p.name == 'P':
-                    # Reward advancement: white towards row 0, black towards row 7
-                    adv = (6 - r) if p.side == 'w' else (r - 1)
-                    score += (adv * 2) if p.side == 'w' else -(adv * 2)
-
-    # Mobility & coop
-    mobility_weights = {'K': 0.3, 'Q': 0.05, 'R': 4,'B': 5, 'N': 5, 'P': 12}
-    mobility_score = 0
-    coop_score = 0
-    for side in ('w', 'b'):
-        orig_turn = state.turn
-        state.turn = side
-        moves = state.generate_all_moves()
-        # 각 기물별 이동 수를 가중합
-        for m in moves:
-            piece = m[3]  # (from,to,meta,piece) 에서 piece
-            mobility_score += mobility_weights[piece.name] * (1 if side == 'w' else -1)
-            target = state.board[m[1][0]][m[1][1]]
-            if target is None:
+            if not p:
                 continue
-            if target.side != side and target.name != 'K':
-                coop_score += (values[target.name]/values[piece.name] if side == 'w' else -values[target.name]/values[piece.name])
-        state.turn = orig_turn
-    # 가중치
+            bit = 1 << _sq_index(r,c)
+            if p.side == 'w':
+                if p.name == 'P': bb['WP'] |= bit
+                elif p.name == 'N': bb['WN'] |= bit
+                elif p.name == 'B': bb['WB'] |= bit
+                elif p.name == 'R': bb['WR'] |= bit
+                elif p.name == 'Q': bb['WQ'] |= bit
+                elif p.name == 'K': bb['WK'] |= bit
+            else:
+                if p.name == 'P': bb['BP'] |= bit
+                elif p.name == 'N': bb['BN'] |= bit
+                elif p.name == 'B': bb['BB'] |= bit
+                elif p.name == 'R': bb['BR'] |= bit
+                elif p.name == 'Q': bb['BQ'] |= bit
+                elif p.name == 'K': bb['BK'] |= bit
+    bb['W'] = bb['WP']|bb['WN']|bb['WB']|bb['WR']|bb['WQ']|bb['WK']
+    bb['B'] = bb['BP']|bb['BN']|bb['BB']|bb['BR']|bb['BQ']|bb['BK']
+    bb['ALL'] = bb['W'] | bb['B']
+    return bb
+
+def _slider_attacks(idx: int, occ: int, deltas: List[Tuple[int,int]]) -> int:
+    # Generate sliding attacks from square by stepping directions until blocked
+    # Convert idx to (r,c) in internal coords
+    # idx = (7 - r)*8 + c → r = 7 - (idx//8), c = idx % 8
+    r = 7 - (idx // 8); c = idx % 8
+    attacks = 0
+    for dr, dc in deltas:
+        rr, cc = r + dr, c + dc
+        while 0 <= rr < 8 and 0 <= cc < 8:
+            b = 1 << _sq_index(rr, cc)
+            attacks |= b
+            if (occ & b):
+                break
+            rr += dr; cc += dc
+    return attacks
+
+def _attacks_for_side(bb: Dict[str,int], side: str) -> Dict[str,int]:
+    occ = bb['ALL']
+    own = bb['W'] if side == 'w' else bb['B']
+    opp = bb['B'] if side == 'w' else bb['W']
+    atk_all = 0
+    # Pawns
+    pawns = bb['WP'] if side=='w' else bb['BP']
+    pmasks = _W_PAWN_ATTACKS if side=='w' else _B_PAWN_ATTACKS
+    pb = pawns
+    pawn_atk = 0
+    while pb:
+        idx, pb = _pop_lsb(pb)
+        pawn_atk |= pmasks[idx]
+    atk_all |= pawn_atk
+    # Knights
+    nb = bb['WN'] if side=='w' else bb['BN']
+    natt = 0
+    while nb:
+        idx, nb = _pop_lsb(nb)
+        natt |= _KNIGHT_ATTACKS[idx]
+    atk_all |= natt
+    # Bishops/Queens (diagonals)
+    bbish = (bb['WB']|bb['WQ']) if side=='w' else (bb['BB']|bb['BQ'])
+    batt = 0
+    db_dirs = [(1,1),(1,-1),(-1,1),(-1,-1)]
+    tmp = bbish
+    while tmp:
+        idx, tmp = _pop_lsb(tmp)
+        batt |= _slider_attacks(idx, occ, db_dirs)
+    atk_all |= batt
+    # Rooks/Queens (orthogonals)
+    brook = (bb['WR']|bb['WQ']) if side=='w' else (bb['BR']|bb['BQ'])
+    ratt = 0
+    ort_dirs = [(1,0),(-1,0),(0,1),(0,-1)]
+    tmp = brook
+    while tmp:
+        idx, tmp = _pop_lsb(tmp)
+        ratt |= _slider_attacks(idx, occ, ort_dirs)
+    atk_all |= ratt
+    # King
+    kingb = bb['WK'] if side=='w' else bb['BK']
+    katt = 0
+    if kingb:
+        idx = (kingb.bit_length() - 1)  # only one king
+        katt = _KING_ATTACKS[idx]
+    atk_all |= katt
+
+    # Mobility counts (exclude own-occupied squares)
+    mobility = (atk_all & (~own))
+    mob_count = mobility.bit_count()
+    # Also count direct attacks on enemy pieces (crude coop proxy)
+    direct_hits = (atk_all & opp).bit_count()
+    return {
+        'attacks': atk_all,
+        'mob': mob_count,
+        'hits': direct_hits,
+    }
+
+def evaluate_position(state: GameState, prev_score: Optional[float] = None) -> float:
+    values = PIECE_VALUES
+    bb = _build_bitboards(state)
+
+    # Material
+    score = 0.0
+    score += values['P'] * (bb['WP'].bit_count() - bb['BP'].bit_count())
+    score += values['N'] * (bb['WN'].bit_count() - bb['BN'].bit_count())
+    score += values['B'] * (bb['WB'].bit_count() - bb['BB'].bit_count())
+    score += values['R'] * (bb['WR'].bit_count() - bb['BR'].bit_count())
+    score += values['Q'] * (bb['WQ'].bit_count() - bb['BQ'].bit_count())
+    # King value is constant; omit from differential
+
+    # Pawn advancement (approximate): white rank - 1; black 6 - rank
+    def _pawn_adv(pawns_bb: int, white: bool) -> int:
+        adv_sum = 0
+        bbp = pawns_bb
+        while bbp:
+            idx, bbp = _pop_lsb(bbp)
+            rank = idx // 8  # 0..7 (rank1..rank8)
+            if white:
+                adv_sum += max(0, rank - 1)
+            else:
+                adv_sum += max(0, 6 - rank)
+        return adv_sum
+    score += 2.0 * _pawn_adv(bb['WP'], True)
+    score -= 2.0 * _pawn_adv(bb['BP'], False)
+
+    # Mobility (fast): count attacked squares excluding own blockers
+    mobility_weights = {'K': 0.3, 'Q': 0.05, 'R': 4,'B': 5, 'N': 5, 'P': 12}
+    w_info = _attacks_for_side(bb, 'w')
+    b_info = _attacks_for_side(bb, 'b')
+    mobility_score = (w_info['mob'] - b_info['mob'])
+    # Small coefficient similar to previous
     score += mobility_score * 0.10023
+
+    # Light cooperation proxy: direct hits on enemy pieces
+    coop_score = (w_info['hits'] - b_info['hits'])
     score += coop_score * 0.200125
 
-    return score
+    return float(score)
 
 # ---------------------
 # Alpha-Beta with MVV-LVA, Killer Moves and History Heuristic + transposition
