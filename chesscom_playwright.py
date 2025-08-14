@@ -377,7 +377,10 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
     to_xy = _sq_to_xy(to_sq)
 
     board = page.locator('wc-chess-board')
-
+    # Track state across attempts; break early on success
+    last_exc = None
+    clicked_piece = False
+    highlighted = False
     for attempt in range(3):
         if _overlay_is_halt(page):
             _force_halt_reset(page)
@@ -387,8 +390,6 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
             board.locator(f'.piece.square-{from_xy}').first,
             board.locator(f'.square-{from_xy}').first
         ]
-        last_exc = None
-        clicked_piece = False
         for pl in piece_locators:
             try:
                 pl.wait_for(state='attached', timeout=500)
@@ -402,12 +403,15 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
 
         # 2) Wait for the piece to be selected (highlight element added)
         hl = board.locator(f'.highlight.square-{from_xy}')
-        highlighted = False
         try:
             hl.wait_for(state='attached', timeout=500)
             highlighted = True
         except Exception:
             time.sleep(0.1)
+
+        # If both succeeded, stop retrying
+        if clicked_piece and highlighted:
+            break
 
     if not clicked_piece:
         raise last_exc or Exception(f"Piece .square-{from_xy} not clickable")
