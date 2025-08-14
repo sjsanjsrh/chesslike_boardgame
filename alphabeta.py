@@ -695,7 +695,7 @@ FUT_MAX_GAIN = PIECE_VALUES.get('Q', 90)  # assume at most queen swing
 FUT_WINDOW = 150  # only apply when window is reasonably narrow (score units)
 
 # Feature flags for pruning modes (tune for performance)
-ENABLE_NULL_MOVE = True  # set True to enable NMP; default off to avoid overhead on this eval
+ENABLE_NULL_MOVE = False  # set True to enable NMP; default off to avoid overhead on this eval
 ENABLE_PVS = True
 
 def move_key_tuple(m):
