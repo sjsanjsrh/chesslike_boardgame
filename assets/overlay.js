@@ -67,6 +67,7 @@
         if (!cfg.mode) cfg.mode = 'seq';
         if (typeof cfg.workers !== 'number') cfg.workers = optimalWorkers(cores);
         if (typeof cfg.showVectors !== 'boolean') cfg.showVectors = true;
+        if (typeof cfg.showPieces !== 'boolean') cfg.showPieces = true;
         if (typeof cfg.thinkOnce !== 'boolean') cfg.thinkOnce = false;
         if (typeof cfg.autoDetect !== 'boolean') cfg.autoDetect = false;
         if (typeof cfg.halt !== 'boolean') cfg.halt = false;
@@ -103,7 +104,8 @@
           +     '<input id="cfg-workers" type="number" min="1" max="64" step="1" style="width:100%;padding:2px 4px;">'
           +     '<label>Options</label>'
           +     '<div>'
-          +       '<label><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
+          +       '<label style="margin-right:8px;"><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
+          +       '<label><input id="cfg-pieces" type="checkbox"> Pieces</label>'
           +     '</div>'
           +   '</div>'
           + '</div>';
@@ -123,6 +125,7 @@
             var workers=document.getElementById('cfg-workers');
             var workersLabel=document.getElementById('cfg-workers-label');
             var vectors=document.getElementById('cfg-vectors');
+            var pieces=document.getElementById('cfg-pieces');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             if (time) {
@@ -132,6 +135,7 @@
             }
             if (workers) workers.value = String(c.workers);
             if (vectors) vectors.checked = !!c.showVectors;
+            if (pieces) pieces.checked = !!c.showPieces;
             if (seq) seq.checked = (c.mode === 'seq');
             if (mp) mp.checked = (c.mode === 'mp');
             var showW = (c.mode === 'mp');
@@ -150,6 +154,7 @@
             var time=document.getElementById('cfg-time');
             var workers=document.getElementById('cfg-workers');
             var vectors=document.getElementById('cfg-vectors');
+            var pieces=document.getElementById('cfg-pieces');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             var run=document.getElementById('cfg-think-now');
@@ -158,6 +163,7 @@
             if (time) time.addEventListener('change', function(){ var v = clamp(time.value, 0.2, 999.0); window.injected_overlayCfgSet({ thinkTime: v }); applyToUi(); });
             if (workers) workers.addEventListener('change', function(){ var v = clamp(workers.value, 1, 64); window.injected_overlayCfgSet({ workers: Math.round(v) }); applyToUi(); });
             if (vectors) vectors.addEventListener('change', function(){ var on = !!vectors.checked; window.injected_overlayCfgSet({ showVectors: on }); applyToUi(); try{ if (!on) { if (window.injected_overlayVectorClear) window.injected_overlayVectorClear(); if (window.injected_overlayVectorLegendClear) window.injected_overlayVectorLegendClear(); } else { if (window.injected_overlayVectorSet) window.injected_overlayVectorSet(window.injected_overlayLastArrows || []); } }catch(e){} });
+            if (pieces) pieces.addEventListener('change', function(){ var on = !!pieces.checked; window.injected_overlayCfgSet({ showPieces: on }); applyToUi(); try{ if (!on) { if (window.injected_overlaySquaresClear) window.injected_overlaySquaresClear(); } }catch(e){} });
             if (seq) seq.addEventListener('change', function(){ if(seq.checked) window.injected_overlayCfgSet({ mode: 'seq' }); applyToUi(); });
             if (mp) mp.addEventListener('change', function(){ if(mp.checked) window.injected_overlayCfgSet({ mode: 'mp' }); applyToUi(); });
             if (run) run.addEventListener('click', function(){ window.injected_overlayCfgSet({ thinkOnce: true, autoDetect: true }); applyToUi(); try{ if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });

@@ -32,7 +32,22 @@
       var s2=svg.style; s2.left=boardRect.left+'px'; s2.top=boardRect.top+'px';
       return svg;
     }
+    function ensureSquaresSvg(boardRect){
+      var id='injected_overlay-squares-svg';
+      var svg=document.getElementById(id);
+      if(!svg){
+        svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.id=id;
+        var s=svg.style; s.position='fixed'; s.pointerEvents='none'; s.zIndex='2147483645';
+        document.body.appendChild(svg);
+      }
+      svg.setAttribute('width', String(boardRect.width));
+      svg.setAttribute('height', String(boardRect.height));
+      var s2=svg.style; s2.left=boardRect.left+'px'; s2.top=boardRect.top+'px';
+      return svg;
+    }
     function clearSvg(){ var svg=document.getElementById('injected_overlay-vector-svg'); if(svg){ while(svg.firstChild) svg.removeChild(svg.firstChild); } }
+    function clearSquaresSvg(){ var svg=document.getElementById('injected_overlay-squares-svg'); if(svg){ while(svg.firstChild) svg.removeChild(svg.firstChild); } }
     function ensureLegend(){
       var root=ensureRoot();
       var id='injected_overlay-vector-legend';
@@ -69,6 +84,7 @@
 
     if(!window.injected_overlayVectorClear){ window.injected_overlayVectorClear = function(){ try{ clearSvg(); }catch(e){} }; }
     if(!window.injected_overlayVectorLegendClear){ window.injected_overlayVectorLegendClear = function(){ try{ clearLegend(); }catch(e){} }; }
+  if(!window.injected_overlaySquaresClear){ window.injected_overlaySquaresClear = function(){ try{ clearSquaresSvg(); }catch(e){} }; }
 
     if(!window.injected_overlayVectorSet){
       window.injected_overlayVectorSet = function(arrows){
@@ -111,5 +127,54 @@
     }
 
     if(!window.injected_overlayVectorShowLast){ window.injected_overlayVectorShowLast = function(){ try{ return window.injected_overlayVectorSet(window.injected_overlayLastArrows || []); }catch(e){ return false; } }; }
+
+    // ========== Per-square debug markers ==========
+    if(!window.injected_overlaySquaresSet){
+      window.injected_overlaySquaresSet = function(squares){
+        try{
+          squares = Array.isArray(squares) ? squares : [];
+          // Honor config toggle
+          try{ if (window.injected_overlayCfg && window.injected_overlayCfg.showPieces === false){ clearSquaresSvg(); return true; } }catch(e){}
+          var host=document.querySelector('wc-chess-board');
+          if(!host){ clearSquaresSvg(); return true; }
+          var r=host.getBoundingClientRect();
+          var svg=ensureSquaresSvg(r); clearSquaresSvg(); var ns=svg.namespaceURI;
+          var cell=Math.max(1, r.width/8);
+          var radius=Math.max(3, Math.min(12, cell*0.16));
+          var fontSize=Math.max(8, Math.min(18, cell*0.28));
+          squares.forEach(function(sq){
+            var p=xyCenter(sq.xy, r);
+            if(!p) return;
+            var color = sq.color || '#4CAF50';
+            var circle=document.createElementNS(ns, 'circle');
+            circle.setAttribute('cx', String(p.x));
+            circle.setAttribute('cy', String(p.y));
+            circle.setAttribute('r', String(radius));
+            circle.setAttribute('fill', color);
+            circle.setAttribute('fill-opacity', '0.22');
+            circle.setAttribute('stroke', color);
+            circle.setAttribute('stroke-opacity', '0.9');
+            circle.setAttribute('stroke-width', '1.2');
+            svg.appendChild(circle);
+            var label = (sq.label!=null) ? String(sq.label) : '';
+            if(label){
+              var text=document.createElementNS(ns, 'text');
+              text.setAttribute('x', String(p.x));
+              text.setAttribute('y', String(p.y + fontSize*0.35));
+              text.setAttribute('text-anchor', 'middle');
+              text.setAttribute('font-family', 'monospace');
+              text.setAttribute('font-size', String(fontSize));
+              text.setAttribute('fill', color);
+              text.setAttribute('stroke', '#000');
+              text.setAttribute('stroke-width', '0.6');
+              text.setAttribute('paint-order', 'stroke');
+              text.textContent = label;
+              svg.appendChild(text);
+            }
+          });
+          return true;
+        }catch(e){ return false; }
+      };
+    }
   }catch(e){}
 })();
