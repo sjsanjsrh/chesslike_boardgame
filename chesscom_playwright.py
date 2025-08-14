@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 import queue
 from typing import List, Optional, Tuple
+import multiprocessing as mp
 
 from alphabeta import fen_to_board, GameState, rc_to_algebraic, iterative_deepening_search
 from simple_multiprocess import get_multiprocess_move
@@ -249,6 +250,14 @@ def _overlay_set(page, html: str, append: bool = False) -> None:
         {"h": html, "a": append},
     )
 
+def _overlay_append_halted_once(page) -> None:
+    try:
+        page.evaluate(
+            "()=>{ try{ if(!window.__aiHaltStamped){ window.__aiHaltStamped=true; if(window.injected_overlayOverlaySet){ window.injected_overlayOverlaySet(\"<div><b>AI</b> <span style='opacity:.85'>halted</span></div>\", true); } } }catch(e){} }"
+        )
+    except Exception:
+        pass
+
 
 def _ensure_config_ui(page, default_time: float = THINK_TIME) -> None:
     # Assets should already be present via context init scripts; just install UI
@@ -289,16 +298,13 @@ def _force_halt_reset(page) -> None:
         _vector_clear(page)
     except Exception:
         pass
-    try:
-        _overlay_set(page, "<div><b>AI</b> <span style='opacity:.85'>halted</span></div>")
-    except Exception:
-        pass
+    _overlay_append_halted_once(page)
 
 def _overlay_clear_halt_keep_cfg(page) -> None:
     """Turn off halt without changing other config flags, update badges if available."""
     try:
         page.evaluate(
-            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }"
+            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } window.__aiHaltStamped=false; }"
         )
     except Exception:
         pass
@@ -541,10 +547,100 @@ def _build_arrows_from_top_moves(top_moves: list) -> list:
     return arrows
 
 
+# ================ Subprocess analysis entrypoint =================
+def _analysis_job_entry(job: dict, out_q) -> None:
+    """Child process entrypoint: run analysis and emit progress/result to out_q.
+
+    job keys: html, my_color, think_time, mode, workers, want_click,
+              prevent_overrun, root_early_abort
+    """
+    try:
+        import time as _time
+        from alphabeta import iterative_deepening_search as _ids
+        from simple_multiprocess import get_multiprocess_move as _mp_get
+        # Set engine flags if provided
+        try:
+            import alphabeta as _ab
+            po = job.get('prevent_overrun')
+            rea = job.get('root_early_abort')
+            if po is not None:
+                _ab.OVERFLOW_PREVENTION = bool(po)
+            if rea is not None:
+                _ab.ROOT_EARLY_ABORT = bool(rea)
+        except Exception:
+            pass
+
+        html = job.get('html') or ''
+        my_color = 'b' if str(job.get('my_color') or '').lower().startswith('b') else 'w'
+        think_time = float(job.get('think_time') or THINK_TIME)
+        mode = str(job.get('mode') or 'seq')
+        workers = int(job.get('workers') or 4)
+        want_click = bool(job.get('want_click') or False)
+
+        gs = load_state_from_chesscom_html(html, turn=my_color)
+        start_ts = _time.time()
+
+        def _progress(evt: dict):
+            # Massage values for AI perspective (white positive)
+            e = dict(evt or {})
+            try:
+                bv = e.get('best_val')
+                if isinstance(bv, (int, float)) and my_color == 'b':
+                    e['best_val'] = -float(bv)
+            except Exception:
+                pass
+            # Map top_moves values for label perspective
+            try:
+                tm = e.get('top_moves')
+                if isinstance(tm, list):
+                    mm = []
+                    for it in tm:
+                        try:
+                            v = it.get('val')
+                            if isinstance(v, (int, float)) and my_color == 'b':
+                                v = -float(v)
+                            mm.append({'from': it.get('from'), 'to': it.get('to'), 'val': v})
+                        except Exception:
+                            mm.append(it)
+                    e['top_moves'] = mm
+            except Exception:
+                pass
+            try:
+                out_q.put_nowait({'type': 'progress', 'evt': e, 'cfg': {
+                    'mode': mode, 'think_time': think_time, 'workers': workers, 'my_color': my_color
+                }})
+            except Exception:
+                pass
+
+        try:
+            if (mode or '').lower().startswith('mp'):
+                move, val, nodes, depth = _mp_get(gs, think_time, max(1, int(workers)), progress=_progress, top_k=5)
+            else:
+                val, move, nodes, depth = _ids(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
+        except Exception as e:
+            try:
+                out_q.put_nowait({'type': 'error', 'error': str(e)})
+            except Exception:
+                pass
+            return
+
+        elapsed = max(0.0, _time.time() - start_ts)
+        try:
+            out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click}})
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            out_q.put_nowait({'type': 'error', 'error': str(e)})
+        except Exception:
+            pass
+
 # ================= Background Analysis Worker =================
 class AnalysisWorker:
-    class Cancelled(Exception):
-        pass
+    """Runs AI analysis jobs in a separate process so they can be force-terminated.
+
+    Parent thread receives progress/result via an internal mp.Queue and forwards to UI.
+    """
 
     def __init__(self):
         self._in_q: "queue.Queue[dict]" = queue.Queue()
@@ -552,7 +648,8 @@ class AnalysisWorker:
         self._thr: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._job_guard = threading.Lock()
-        self._cancel_current = threading.Event()
+        self._proc: Optional[mp.Process] = None
+        self._mp_out_q: Optional[mp.Queue] = None
 
     @property
     def out_queue(self):
@@ -567,6 +664,11 @@ class AnalysisWorker:
 
     def stop(self):
         self._stop.set()
+        # Kill any running job process first
+        try:
+            self.kill_current()
+        except Exception:
+            pass
         try:
             self._in_q.put_nowait({'type': 'stop'})
         except Exception:
@@ -577,22 +679,52 @@ class AnalysisWorker:
             except Exception:
                 pass
 
-    def cancel_current(self) -> None:
-        """Signal cancellation to the currently running job (non-blocking)."""
+    def kill_current(self) -> None:
+        """Force-terminate the currently running analysis process (if any)."""
+        proc = self._proc
+        self._proc = None
         try:
-            self._cancel_current.set()
+            if proc is not None and proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if self._mp_out_q is not None:
+                try:
+                    # Drain quickly to avoid pipe leaks, then close
+                    while True:
+                        _ = self._mp_out_q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self._mp_out_q.close()
+                except Exception:
+                    pass
+        finally:
+            self._mp_out_q = None
+        # Notify UI as cancelled
+        try:
+            self._out_q.put_nowait({'type': 'cancelled'})
         except Exception:
             pass
 
-    def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool):
+    def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool,
+               prevent_overrun: Optional[bool] = None, root_early_abort: Optional[bool] = None):
         """Submit a new analysis job, cancelling any previous."""
         with self._job_guard:
-            self._cancel_current.set()  # signal cancel to current job
+            # Force terminate running job (if any) before enqueuing new one
+            try:
+                self.kill_current()
+            except Exception:
+                pass
             try:
                 self._in_q.put_nowait({
                     'type': 'job', 'html': html, 'my_color': my_color,
                     'think_time': float(think_time), 'mode': str(mode or 'seq'),
-                    'workers': int(max(1, workers or 1)), 'want_click': bool(want_click)
+                    'workers': int(max(1, workers or 1)), 'want_click': bool(want_click),
+                    'prevent_overrun': bool(prevent_overrun) if prevent_overrun is not None else None,
+                    'root_early_abort': bool(root_early_abort) if root_early_abort is not None else None,
                 })
             except Exception:
                 pass
@@ -607,88 +739,69 @@ class AnalysisWorker:
                 break
             if item.get('type') != 'job':
                 continue
-            # Prepare job
-            html = item.get('html') or ''
-            my_color = 'b' if str(item.get('my_color') or '').lower().startswith('b') else 'w'
-            think_time = float(item.get('think_time') or THINK_TIME)
-            mode = str(item.get('mode') or 'seq')
-            workers = int(item.get('workers') or 4)
-            want_click = bool(item.get('want_click') or False)
-            # Reset cancel flag for this job
-            self._cancel_current.clear()
+            # Prepare job for subprocess
+            job = {
+                'html': item.get('html') or '',
+                'my_color': 'b' if str(item.get('my_color') or '').lower().startswith('b') else 'w',
+                'think_time': float(item.get('think_time') or THINK_TIME),
+                'mode': str(item.get('mode') or 'seq'),
+                'workers': int(item.get('workers') or 4),
+                'want_click': bool(item.get('want_click') or False),
+                'prevent_overrun': item.get('prevent_overrun'),
+                'root_early_abort': item.get('root_early_abort'),
+            }
 
-            gs = load_state_from_chesscom_html(html, turn=my_color)
-            start_ts = time.time()
-            last_best = {'move': None, 'val': None}
-
-            def _progress(evt: dict):
-                if self._cancel_current.is_set():
-                    raise AnalysisWorker.Cancelled()
-                # massage values to AI perspective for display only
-                e = dict(evt or {})
-                try:
-                    bv = e.get('best_val')
-                    if isinstance(bv, (int, float)) and my_color == 'b':
-                        e['best_val'] = -float(bv)
-                except Exception:
-                    pass
-                # keep last seen best
-                try:
-                    if e.get('best_move'):
-                        last_best['move'] = e.get('best_move')
-                        last_best['val'] = e.get('best_val')
-                except Exception:
-                    pass
-                # map top_moves values for label perspective
-                try:
-                    tm = e.get('top_moves')
-                    if isinstance(tm, list):
-                        mm = []
-                        for it in tm:
-                            try:
-                                v = it.get('val')
-                                if isinstance(v, (int, float)) and my_color == 'b':
-                                    v = -float(v)
-                                mm.append({'from': it.get('from'), 'to': it.get('to'), 'val': v})
-                            except Exception:
-                                mm.append(it)
-                        e['top_moves'] = mm
-                except Exception:
-                    pass
-                try:
-                    self._out_q.put_nowait({'type': 'progress', 'evt': e, 'cfg': {
-                        'mode': mode, 'think_time': think_time, 'workers': workers, 'my_color': my_color
-                    }, 'last_best': dict(last_best)})
-                except Exception:
-                    pass
-
-            # run engine
+            # Start subprocess and pump messages to _out_q
             try:
-                if (mode or '').lower().startswith('mp'):
-                    def _mp_progress(evt: dict):
-                        _progress(evt)
-                    move, val, nodes, depth = get_multiprocess_move(gs, think_time, max(1, int(workers)), progress=_mp_progress, top_k=5)
-                else:
-                    val, move, nodes, depth = iterative_deepening_search(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
-            except AnalysisWorker.Cancelled:
-                # cancelled: emit a notice and continue
-                try:
-                    self._out_q.put_nowait({'type': 'cancelled'})
-                except Exception:
-                    pass
-                continue
-            except Exception as e:
-                try:
-                    self._out_q.put_nowait({'type': 'error', 'error': str(e)})
-                except Exception:
-                    pass
-                continue
-
-            elapsed = max(0.0, time.time() - start_ts)
-            try:
-                self._out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click}})
+                self.kill_current()
             except Exception:
                 pass
+            self._mp_out_q = mp.Queue()
+            self._proc = mp.Process(target=_analysis_job_entry, args=(job, self._mp_out_q))
+            self._proc.daemon = True
+            self._proc.start()
+
+            # Pump messages until process exits and queue is drained
+            proc = self._proc
+            mp_q = self._mp_out_q
+            while proc is not None and proc.is_alive():
+                if self._stop.is_set():
+                    try:
+                        self.kill_current()
+                    except Exception:
+                        pass
+                    break
+                try:
+                    ev = mp_q.get(timeout=0.2)
+                    if ev:
+                        self._out_q.put_nowait(ev)
+                        if ev.get('type') in ('result', 'error'):
+                            # Wait a short moment for any remaining progress then exit
+                            time.sleep(0.05)
+                            break
+                except Exception:
+                    pass
+            # Drain any remaining messages
+            try:
+                while True:
+                    ev = mp_q.get_nowait()
+                    if ev:
+                        self._out_q.put_nowait(ev)
+            except Exception:
+                pass
+            # Join and cleanup
+            try:
+                if proc is not None:
+                    proc.join(timeout=0.5)
+            except Exception:
+                pass
+            try:
+                if mp_q is not None:
+                    mp_q.close()
+            except Exception:
+                pass
+            self._proc = None
+            self._mp_out_q = None
 
 
 def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME, mode: str = 'seq', workers: int = 4, show_vectors: bool = True) -> bool:
@@ -1015,7 +1128,7 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                 print("[auto] 게임 종료 감지됨: Halt")
                 _overlay_set_halt(page)
                 try:
-                    _vector_clear(page)
+                    worker.kill_current()
                 except Exception:
                     pass
         except Exception:
@@ -1050,7 +1163,22 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
             if think_once or auto_detect_on:
                 _overlay_clear_halt_keep_cfg(page)
             else:
-                _force_halt_reset(page)
+                # Force-stop running analysis only; keep UI as-is
+                try:
+                    worker.kill_current()
+                except Exception:
+                    pass
+                # Immediately mark UI as halted and clear vectors
+                try:
+                    _overlay_append_halted_once(page)
+                except Exception:
+                    pass
+                # Drain any pending events to avoid stale overlays later
+                try:
+                    while True:
+                        _ = out_q.get_nowait()
+                except Exception:
+                    pass
                 time.sleep(poll_s_idle)
                 continue
 
@@ -1065,6 +1193,14 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_now))
             except Exception:
                 pass
+            # Immediately show starting status to override any previous overlay
+            try:
+                cfg_label = f"mode={mode} | time={cur_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+                _overlay_set(page, f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div><div>starting…</div>")
+                if show_vectors:
+                    _vector_clear(page)
+            except Exception:
+                pass
             # 엔진에 과도초과 방지 옵션 전달은 글로벌/모듈 플래그로 처리
             try:
                 import alphabeta as _ab
@@ -1072,11 +1208,9 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                 _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
             except Exception:
                 pass
-            worker.submit(html_now, my_color, cur_time, mode, workers, want_click=True)
+            worker.submit(html_now, my_color, cur_time, mode, workers, want_click=True,
+                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort)
             active_job = True
-            active_want_click = True
-            # 진행은 out_queue 이벤트로 처리
-            # 계속 루프 진행
 
         try:
             html_now = _get_current_html(page)
@@ -1114,6 +1248,14 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_conf))
                             except Exception:
                                 pass
+                            # Immediately show starting status to override any previous overlay
+                            try:
+                                cfg_label = f"mode={mode} | time={cur_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+                                _overlay_set(page, f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div><div>starting…</div>")
+                                if show_vectors:
+                                    _vector_clear(page)
+                            except Exception:
+                                pass
                             # 엔진 플래그 업데이트
                             try:
                                 import alphabeta as _ab
@@ -1121,7 +1263,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                 _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
                             except Exception:
                                 pass
-                            worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True)
+                            worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True,
+                                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort)
                             active_job = True
                             active_want_click = True
                 else:
