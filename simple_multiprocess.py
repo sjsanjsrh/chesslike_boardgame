@@ -42,8 +42,17 @@ def _root_move_key(m):
     # 더 높은 점수 먼저 오도록 음수로
     return (-is_cap, -is_prom)
 
-def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: Optional[int] = None,
-                          progress=None, top_k: int = 5):
+def get_multiprocess_move(
+    state: GameState,
+    max_time: float = 2.0,
+    max_workers: Optional[int] = None,
+    progress=None,
+    top_k: int = 5,
+    *,
+    prevent_overrun: bool = True,
+    root_early_abort: bool = False,
+    overrun_budget: float = 0.5,
+):
     """
     병렬 루트 라운드 탐색(부분완료 허용):
     - 깊이 d에서 루트 무브들을 동일 고정 깊이로 병렬 평가(child_depth=d-1)
@@ -72,6 +81,8 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
     side = state.turn
     start_ts = time.time()
     deadline = start_ts + max_time
+    # If overrun is allowed, extend an allowed end time by a small budget
+    allowed_end = deadline if prevent_overrun else (deadline + max(0.0, float(overrun_budget)))
 
     # 설정: 시작 깊이 및 최대 라운드 상한(안전장치)
     if max_time <= 0.4:
@@ -88,6 +99,7 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
     last_partial_depth = 0
     nodes_total = 0
     last_top_moves: Optional[List[dict]] = None
+    last_full_time: Optional[float] = None
 
     # helpers
     def _emit(payload: dict):
@@ -123,7 +135,16 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
     try:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             depth = start_depth
-            while depth <= max_depth_cap and time.time() < deadline:
+            while depth <= max_depth_cap and time.time() < allowed_end:
+                # Pre-entry cost estimation: if enabled, decide whether to start this depth
+                if root_early_abort and last_full_time is not None:
+                    # naive growth factor estimate; can be tuned or made adaptive later
+                    growth_factor = 2.5
+                    est_time = last_full_time * growth_factor
+                    now_chk = time.time()
+                    if now_chk + est_time > allowed_end:
+                        # Skip entering this depth to avoid likely overrun
+                        break
                 # child 고정 깊이는 루트에서 한 수 둔 다음이므로 depth-1
                 child_depth = max(0, depth - 1)
                 # 루트 무브 간단 정렬(캡처/프로모션 우선)
@@ -139,7 +160,7 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
                     'best_move': None,
                     'best_val': None,
                 })
-
+                depth_start_ts = now
                 futures = [executor.submit(_evaluate_child_position, (state, m, child_depth)) for m in ordered]
 
                 round_results: List[Tuple[tuple, float, int, int]] = []
@@ -147,8 +168,10 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
 
                 # poll futures periodically for timely updates
                 pending = set(futures)
-                while pending and time.time() < deadline:
-                    slice_deadline = min(0.2, max(0.0, deadline - time.time()))
+                # If overrun is allowed, wait until allowed_end; otherwise, stop at deadline
+                while pending and time.time() < (allowed_end if not prevent_overrun else deadline):
+                    horizon = (allowed_end if not prevent_overrun else deadline)
+                    slice_deadline = min(0.2, max(0.0, horizon - time.time()))
                     if slice_deadline <= 0:
                         break
                     done, pending = wait(pending, timeout=slice_deadline)
@@ -184,18 +207,20 @@ def get_multiprocess_move(state: GameState, max_time: float = 2.0, max_workers: 
                         'top_moves': top_moves,
                     })
 
-                # cancel remaining if any
-                for fut in pending:
-                    try:
-                        fut.cancel()
-                    except Exception:
-                        pass
+                # cancel remaining if we ran out of allowance; otherwise we finished fully
+                if pending:
+                    for fut in pending:
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
 
                 if round_results and len(round_results) == len(ordered):
                     # 라운드 완주
                     last_full_results = round_results
                     last_full_depth = depth
                     now = time.time()
+                    last_full_time = max(0.0, now - depth_start_ts)
                     top_moves = _top_from_results(last_full_results, top_k)
                     last_top_moves = top_moves
                     # report depth_complete with best snapshot

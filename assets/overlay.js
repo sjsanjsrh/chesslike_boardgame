@@ -74,6 +74,8 @@
         if (typeof cfg.halt !== 'boolean') cfg.halt = false;
         // Experimental: root early-abort toggle (separate from overrun prevention)
         if (typeof cfg.rootEarlyAbort !== 'boolean') cfg.rootEarlyAbort = false;
+        // Overrun budget (seconds) when preventOverrun is OFF
+        if (typeof cfg.overrunBudget !== 'number' || !isFinite(cfg.overrunBudget) || cfg.overrunBudget < 0) cfg.overrunBudget = 0.6;
         if (cfg.myColor !== 'w' && cfg.myColor !== 'b') cfg.myColor = 'w';
         if (typeof cfg.collapsed !== 'boolean') cfg.collapsed = true;
         window.injected_overlayCfg = cfg;
@@ -111,7 +113,9 @@
           +      '<label style="margin-right:8px;"><input id="cfg-pieces" type="checkbox"> Pieces</label>'
           +      '<label style="margin-right:8px;"><input id="cfg-overrun" type="checkbox" checked> overrun block</label>'
           +      '<label style="margin-right:8px;"><input id="cfg-root-early" type="checkbox"> root-early block</label>'
-          +     '</div>'
+          +    '</div>'
+          +    '<label>Overrun Budget (s)</label>'
+          +    '<input id="cfg-overrun-budget" type="number" min="0" step="0.1" style="width:100%;padding:2px 4px;">'
           +    '</div>'
           +  '</div>'
           +'</div>';
@@ -133,6 +137,7 @@
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
             var overrun=document.getElementById('cfg-overrun');
+            var overrunBudget=document.getElementById('cfg-overrun-budget');
             var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
@@ -145,6 +150,7 @@
             if (vectors) vectors.checked = !!c.showVectors;
             if (pieces) pieces.checked = !!c.showPieces;
             if (overrun) overrun.checked = !!c.preventOverrun;
+            if (overrunBudget) overrunBudget.value = String((typeof c.overrunBudget==='number' && isFinite(c.overrunBudget) ? c.overrunBudget : 0.6).toFixed ? c.overrunBudget.toFixed(1) : c.overrunBudget);
             if (rootEarly) rootEarly.checked = !!c.rootEarlyAbort;
             if (seq) seq.checked = (c.mode === 'seq');
             if (mp) mp.checked = (c.mode === 'mp');
@@ -166,6 +172,7 @@
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
             var overrun=document.getElementById('cfg-overrun');
+            var overrunBudget=document.getElementById('cfg-overrun-budget');
             var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
@@ -182,6 +189,7 @@
             if (halt) halt.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ halt: true, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });
             if (toggle) toggle.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ collapsed: !window.injected_overlayCfg.collapsed }); }catch(e){} applyToUi(); });
             if (overrun) overrun.addEventListener('change', function(){ var on = !!overrun.checked; window.injected_overlayCfgSet({ preventOverrun: on }); });
+            if (overrunBudget) overrunBudget.addEventListener('change', function(){ var v = clamp(overrunBudget.value, 0, 30); window.injected_overlayCfgSet({ overrunBudget: Number(v) }); applyToUi(); });
             if (rootEarly) rootEarly.addEventListener('change', function(){ var on = !!rootEarly.checked; window.injected_overlayCfgSet({ rootEarlyAbort: on }); });
           }catch(e){}
           applyToUi();

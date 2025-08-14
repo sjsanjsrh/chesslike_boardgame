@@ -359,15 +359,19 @@ def _pl_click_move_simple(page, from_sq: str, to_sq: str) -> None:
     except Exception:
         pass
     if flipped:
-        tx = bx + ((8 - tf + 0.5) * (bw / 8))
-        ty = by + ((tr - 1 + 0.5) * (bh / 8))
+        lx = ((8 - tf + 0.5) * (bw / 8))
+        ly = ((tr - 1 + 0.5) * (bh / 8))
     else:
-        tx = bx + ((tf - 1 + 0.5) * (bw / 8))
-        ty = by + ((8 - tr + 0.5) * (bh / 8))
+        lx = ((tf - 1 + 0.5) * (bw / 8))
+        ly = ((8 - tr + 0.5) * (bh / 8))
+    # Click relative to the board element for better targeting; fallback to page mouse
     try:
-        page.mouse.click(tx, ty)
+        board.click(position={"x": lx, "y": ly}, force=True, timeout=800)
     except Exception:
-        pass
+        try:
+            page.mouse.click(bx + lx, by + ly)
+        except Exception:
+            pass
 
 def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: int = 6000) -> None:
     """Click a move by selecting a piece and then clicking the destination square directly.
@@ -445,12 +449,19 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
     except Exception:
         raise Exception(f"Invalid to_xy: {to_xy}")
     if _board_flipped(page.content()):
-        to_x = board_x + ((8 - to_file + 0.5) * (board_w / 8))
-        to_y = board_y + ((to_rank - 1 + 0.5) * (board_h / 8))
+        local_x = ((8 - to_file + 0.5) * (board_w / 8))
+        local_y = ((to_rank - 1 + 0.5) * (board_h / 8))
     else:
-        to_x = board_x + ((to_file - 1 + 0.5) * (board_w / 8))
-        to_y = board_y + ((8 - to_rank + 0.5) * (board_h / 8))
-    page.mouse.click(to_x, to_y)
+        local_x = ((to_file - 1 + 0.5) * (board_w / 8))
+        local_y = ((8 - to_rank + 0.5) * (board_h / 8))
+    try:
+        board.click(position={"x": local_x, "y": local_y}, force=True, timeout=800)
+    except Exception:
+        # fallback to absolute page click
+        try:
+            page.mouse.click(board_x + local_x, board_y + local_y)
+        except Exception:
+            pass
 
     # 4) Verify applied robustly
     def _origin_empty() -> bool:
@@ -580,6 +591,10 @@ def _analysis_job_entry(job: dict, out_q) -> None:
         mode = str(job.get('mode') or 'seq')
         workers = int(job.get('workers') or 4)
         want_click = bool(job.get('want_click') or False)
+        try:
+            overrun_budget = float(job.get('overrun_budget')) if job.get('overrun_budget') is not None else 0.6
+        except Exception:
+            overrun_budget = 0.6
 
         gs = load_state_from_chesscom_html(html, turn=my_color)
         start_ts = _time.time()
@@ -628,9 +643,21 @@ def _analysis_job_entry(job: dict, out_q) -> None:
 
         try:
             if (mode or '').lower().startswith('mp'):
-                move, val, nodes, depth = _mp_get(gs, think_time, max(1, int(workers)), progress=_progress, top_k=5)
+                move, val, nodes, depth = _mp_get(
+                    gs,
+                    think_time,
+                    max(1, int(workers)),
+                    progress=_progress,
+                    top_k=5,
+                    prevent_overrun=bool(job.get('prevent_overrun')) if job.get('prevent_overrun') is not None else True,
+                    root_early_abort=bool(job.get('root_early_abort')) if job.get('root_early_abort') is not None else False,
+                    overrun_budget=overrun_budget,
+                )
             else:
-                val, move, nodes, depth = _ids(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
+                # For SEQ, allow budget extension when overrun prevention is off
+                prevent = bool(job.get('prevent_overrun')) if job.get('prevent_overrun') is not None else True
+                eff_time = float(think_time + (0.0 if prevent else max(0.0, overrun_budget)))
+                val, move, nodes, depth = _ids(gs, max_time=eff_time, start_depth=4, progress=_progress, top_k=5)
         except Exception as e:
             try:
                 out_q.put_nowait({'type': 'error', 'error': str(e)})
@@ -730,7 +757,8 @@ class AnalysisWorker:
             pass
 
     def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool,
-               prevent_overrun: Optional[bool] = None, root_early_abort: Optional[bool] = None):
+               prevent_overrun: Optional[bool] = None, root_early_abort: Optional[bool] = None,
+               overrun_budget: Optional[float] = None):
         """Submit a new analysis job, cancelling any previous."""
         with self._job_guard:
             # Force terminate running job (if any) before enqueuing new one
@@ -739,13 +767,19 @@ class AnalysisWorker:
             except Exception:
                 pass
             try:
-                self._in_q.put_nowait({
+                payload = {
                     'type': 'job', 'html': html, 'my_color': my_color,
                     'think_time': float(think_time), 'mode': str(mode or 'seq'),
                     'workers': int(max(1, workers or 1)), 'want_click': bool(want_click),
                     'prevent_overrun': bool(prevent_overrun) if prevent_overrun is not None else None,
                     'root_early_abort': bool(root_early_abort) if root_early_abort is not None else None,
-                })
+                }
+                if overrun_budget is not None:
+                    try:
+                        payload['overrun_budget'] = float(overrun_budget)
+                    except Exception:
+                        payload['overrun_budget'] = None
+                self._in_q.put_nowait(payload)
             except Exception:
                 pass
 
@@ -769,6 +803,7 @@ class AnalysisWorker:
                 'want_click': bool(item.get('want_click') or False),
                 'prevent_overrun': item.get('prevent_overrun'),
                 'root_early_abort': item.get('root_early_abort'),
+                'overrun_budget': item.get('overrun_budget'),
             }
 
             # If requested mode is mp, run analysis in a thread so that any
@@ -955,6 +990,13 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
 
     if (mode or '').lower().startswith('mp'):
         try:
+            cfg_cur = {}
+            try:
+                cfg_cur = _get_cfg(page) or {}
+            except Exception:
+                cfg_cur = {}
+            prevent_overrun_flag = bool(cfg_cur.get('preventOverrun') if cfg_cur.get('preventOverrun') is not None else True)
+            root_early_abort_flag = bool(cfg_cur.get('rootEarlyAbort') if cfg_cur.get('rootEarlyAbort') is not None else False)
             def _mp_progress(evt: dict):
                 try:
                     _progress(evt)
@@ -962,7 +1004,16 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                     raise
                 except Exception:
                     pass
-            move, val, nodes, depth = get_multiprocess_move(gs, think_time, max(1, int(workers or 1)), progress=_mp_progress, top_k=5)
+            move, val, nodes, depth = get_multiprocess_move(
+                gs,
+                think_time,
+                max(1, int(workers or 1)),
+                progress=_mp_progress,
+                top_k=5,
+                prevent_overrun=prevent_overrun_flag,
+                root_early_abort=root_early_abort_flag,
+                overrun_budget=0.6,
+            )
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
             _force_halt_reset(page)
@@ -1247,8 +1298,16 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                 _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
             except Exception:
                 pass
-            worker.submit(html_now, my_color, cur_time, mode, workers, want_click=True,
-                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort)
+            # Pull overrunBudget from overlay config
+            try:
+                overrun_budget = float(cfg.get('overrunBudget')) if cfg.get('overrunBudget') is not None else 0.6
+            except Exception:
+                overrun_budget = 0.6
+            worker.submit(
+                html_now, my_color, cur_time, mode, workers, want_click=True,
+                prevent_overrun=prevent_overrun, root_early_abort=root_early_abort,
+                overrun_budget=overrun_budget,
+            )
             active_job = True
 
         try:
