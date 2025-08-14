@@ -997,6 +997,11 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                 cfg_cur = {}
             prevent_overrun_flag = bool(cfg_cur.get('preventOverrun') if cfg_cur.get('preventOverrun') is not None else True)
             root_early_abort_flag = bool(cfg_cur.get('rootEarlyAbort') if cfg_cur.get('rootEarlyAbort') is not None else False)
+            # Fetch overrun budget from overlay config (fallback to 0.6)
+            try:
+                overrun_budget_val = float(cfg_cur.get('overrunBudget')) if cfg_cur.get('overrunBudget') is not None else 0.6
+            except Exception:
+                overrun_budget_val = 0.6
             def _mp_progress(evt: dict):
                 try:
                     _progress(evt)
@@ -1012,7 +1017,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                 top_k=5,
                 prevent_overrun=prevent_overrun_flag,
                 root_early_abort=root_early_abort_flag,
-                overrun_budget=overrun_budget_cfg,
+                overrun_budget=overrun_budget_val,
             )
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
