@@ -577,6 +577,13 @@ class AnalysisWorker:
             except Exception:
                 pass
 
+    def cancel_current(self) -> None:
+        """Signal cancellation to the currently running job (non-blocking)."""
+        try:
+            self._cancel_current.set()
+        except Exception:
+            pass
+
     def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool):
         """Submit a new analysis job, cancelling any previous."""
         with self._job_guard:
@@ -938,73 +945,6 @@ def _navigate_with_fallback(page, url: str, alt_url: Optional[str] = None) -> No
         pass
 
 
-def _wait_for_board_change(page, last_fen: str, my_color: str, timeout_s: float = 120.0, poll_s: float = 0.5) -> Tuple[str, str]:
-    """Wait for a stable board change. Expect an opponent move:
-    - Opponent piece-count should remain the same (or increase only in promotions, which we'll treat as same for count),
-    - My piece-count should be either same (quiet) or -1 (if my piece was captured).
-    The new FEN must be different and stable across two samples.
-    """
-    def _cnt_side(f: str, is_white: bool) -> int:
-        return sum(1 for ch in f if (ch.isupper() if is_white else ch.islower()))
-
-    opp_is_white = (str(my_color).lower().startswith('b'))
-    me_is_white = not opp_is_white
-    last_cnt_opp = _cnt_side(last_fen, opp_is_white)
-    last_cnt_me = _cnt_side(last_fen, me_is_white)
-    deadline = time.time() + timeout_s
-    last_stable = None  # track last stable pair for fallback
-    stable_repeats = 0
-    while time.time() < deadline:
-        if _overlay_is_halt(page):
-            _force_halt_reset(page)
-            raise TimeoutError("halted")
-        html1 = _get_current_html(page)
-        fen1 = parse_chesscom_html_to_fen(html1)
-        if fen1 != last_fen:
-            # debounce/stability check
-            time.sleep(min(0.2, max(0.1, poll_s/2)))
-            html2 = _get_current_html(page)
-            fen2 = parse_chesscom_html_to_fen(html2)
-            if fen2 == fen1:
-                # track stability
-                if last_stable == fen2:
-                    stable_repeats += 1
-                else:
-                    last_stable = fen2
-                    stable_repeats = 1
-                try:
-                    cnt2_opp = _cnt_side(fen2, opp_is_white)
-                    cnt2_me = _cnt_side(fen2, me_is_white)
-                    ok_counts = (cnt2_opp == last_cnt_opp) and (cnt2_me in (last_cnt_me, last_cnt_me - 1))
-                    # Very conservative check: ensure the board diff looks like an opponent move
-                    ok_plausible = _plausible_opponent_move(last_fen, fen2, my_color)
-                    if ok_counts and ok_plausible:
-                        # micro grace: absorb rapid consecutive updates (animations/instant reply)
-                        micro_deadline = time.time() + min(0.25, max(0.1, poll_s))
-                        latest_html, latest_fen = html2, fen2
-                        while time.time() < micro_deadline:
-                            html3 = _get_current_html(page)
-                            fen3 = parse_chesscom_html_to_fen(html3)
-                            if fen3 != latest_fen:
-                                # restart confirmation for the new change
-                                time.sleep(min(0.2, max(0.08, poll_s/2)))
-                                html4 = _get_current_html(page)
-                                fen4 = parse_chesscom_html_to_fen(html4)
-                                if fen4 == fen3:
-                                    latest_html, latest_fen = html4, fen4
-                                    continue
-                            time.sleep(min(0.12, max(0.06, poll_s/3)))
-                        return latest_html, latest_fen
-                    # strong stability fallback: if counts rule fails but we've seen >=3 repeats, accept
-                    if stable_repeats >= 3 and ok_plausible:
-                        return html2, fen2
-                except Exception:
-                    # If counting fails, still accept stable change
-                    return html2, fen2
-        time.sleep(poll_s)
-    raise TimeoutError("board change wait timeout")
-
-
 def _get_cfg(page) -> dict:
     try:
         return page.evaluate("()=> (window.injected_overlayCfgGet && window.injected_overlayCfgGet()) || null") or {}
@@ -1096,6 +1036,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
         workers = int(cfg.get('workers') or 4)
         show_vectors = bool(cfg.get('showVectors') if cfg.get('showVectors') is not None else True)
         show_pieces = bool(cfg.get('showPieces') if cfg.get('showPieces') is not None else False)
+        prevent_overrun = bool(cfg.get('preventOverrun') if cfg.get('preventOverrun') is not None else True)
+        root_early_abort = bool(cfg.get('rootEarlyAbort') if cfg.get('rootEarlyAbort') is not None else False)
         think_once = bool(cfg.get('thinkOnce') or False)
         auto_detect_on = bool(cfg.get('autoDetect') or False)
         # 루프마다 myColor 최신값 사용
@@ -1121,6 +1063,13 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
             try:
                 if show_pieces:
                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_now))
+            except Exception:
+                pass
+            # 엔진에 과도초과 방지 옵션 전달은 글로벌/모듈 플래그로 처리
+            try:
+                import alphabeta as _ab
+                _ab.OVERFLOW_PREVENTION = bool(prevent_overrun)
+                _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
             except Exception:
                 pass
             worker.submit(html_now, my_color, cur_time, mode, workers, want_click=True)
@@ -1163,6 +1112,13 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                             try:
                                 if show_pieces:
                                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_conf))
+                            except Exception:
+                                pass
+                            # 엔진 플래그 업데이트
+                            try:
+                                import alphabeta as _ab
+                                _ab.OVERFLOW_PREVENTION = bool(prevent_overrun)
+                                _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
                             except Exception:
                                 pass
                             worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True)

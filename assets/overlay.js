@@ -68,9 +68,12 @@
         if (typeof cfg.workers !== 'number') cfg.workers = optimalWorkers(cores);
         if (typeof cfg.showVectors !== 'boolean') cfg.showVectors = true;
         if (typeof cfg.showPieces !== 'boolean') cfg.showPieces = true;
+        if (typeof cfg.preventOverrun !== 'boolean') cfg.preventOverrun = true;
         if (typeof cfg.thinkOnce !== 'boolean') cfg.thinkOnce = false;
         if (typeof cfg.autoDetect !== 'boolean') cfg.autoDetect = false;
         if (typeof cfg.halt !== 'boolean') cfg.halt = false;
+        // Experimental: root early-abort toggle (separate from overrun prevention)
+        if (typeof cfg.rootEarlyAbort !== 'boolean') cfg.rootEarlyAbort = false;
         if (cfg.myColor !== 'w' && cfg.myColor !== 'b') cfg.myColor = 'w';
         if (typeof cfg.collapsed !== 'boolean') cfg.collapsed = true;
         window.injected_overlayCfg = cfg;
@@ -82,33 +85,36 @@
         if(!el){
           el=document.createElement('div');
           el.id=id;
-          el.innerHTML = ''+
-            '<div style="display:flex;align-items:center;gap:8px;">'
-          +   '<button id="cfg-toggle" title="펼치기/접기" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;">▸</button>'
-          +   '<b style="flex:1 1 auto;">AI Settings</b>'
-          +   '<div style="margin-left:auto;display:flex;gap:6px;align-items:center;">'
+          el.innerHTML = ''
+          +'<div style="display:flex;align-items:center;gap:8px;">'
+          +  '<button id="cfg-toggle" title="펼치기/접기" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;">▸</button>'
+          +  '<b style="flex:1 1 auto;">AI Settings</b>'
+          +  '<div style="margin-left:auto;display:flex;gap:6px;align-items:center;">'
           +     '<button id="cfg-halt" style="background:#F44336;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Halt</button>'
           +     '<button id="cfg-think-now" style="background:#2196F3;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Run AI</button>'
-          +   '</div>'
+          +  '</div>'
           + '</div>'
-          + '<div id="cfg-body" style="margin-top:6px;">'
-          +   '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;align-items:center;">'
-          +     '<label>Time (s)</label>'
-          +     '<input id="cfg-time" type="number" min="0.2" step="0.1" style="width:100%;padding:2px 4px;">'
-          +     '<label>Mode</label>'
-          +     '<div>'
-          +       '<label style="margin-right:6px;"><input type="radio" name="cfg-mode" value="seq"> SEQ</label>'
-          +       '<label><input type="radio" name="cfg-mode" value="mp"> MP</label>'
+          +'<div id="cfg-body" style="margin-top:6px;">'
+          +  '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;align-items:center;">'
+          +    '<label>Time (s)</label>'
+          +    '<input id="cfg-time" type="number" min="0.2" step="0.1" style="width:100%;padding:2px 4px;">'
+          +    '<label>Mode</label>'
+          +    '<div>'
+          +      '<label style="margin-right:6px;"><input type="radio" name="cfg-mode" value="seq"> SEQ</label>'
+          +      '<label><input type="radio" name="cfg-mode" value="mp"> MP</label>'
+          +    '</div>'
+          +    '<label id="cfg-workers-label">Workers</label>'
+          +    '<input id="cfg-workers" type="number" min="1" max="64" step="1" style="width:100%;padding:2px 4px;">'
+          +    '<label>Options</label>'
+          +    '<div style="display:flex; flex-wrap:wrap; align-items:center; column-gap:8px; row-gap:4px;">'
+          +      '<label style="margin-right:8px;"><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-pieces" type="checkbox"> Pieces</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-overrun" type="checkbox" checked> overrun block</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-root-early" type="checkbox"> root-early block</label>'
           +     '</div>'
-          +     '<label id="cfg-workers-label">Workers</label>'
-          +     '<input id="cfg-workers" type="number" min="1" max="64" step="1" style="width:100%;padding:2px 4px;">'
-          +     '<label>Options</label>'
-          +     '<div>'
-          +       '<label style="margin-right:8px;"><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
-          +       '<label><input id="cfg-pieces" type="checkbox"> Pieces</label>'
-          +     '</div>'
-          +   '</div>'
-          + '</div>';
+          +    '</div>'
+          +  '</div>'
+          +'</div>';
           // Insert settings panel below the badge bar if it exists, otherwise at top
           var __bar = document.getElementById('injected_overlay-badges');
           if(__bar && __bar.parentNode === root){
@@ -126,6 +132,8 @@
             var workersLabel=document.getElementById('cfg-workers-label');
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
+            var overrun=document.getElementById('cfg-overrun');
+            var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             if (time) {
@@ -136,6 +144,8 @@
             if (workers) workers.value = String(c.workers);
             if (vectors) vectors.checked = !!c.showVectors;
             if (pieces) pieces.checked = !!c.showPieces;
+            if (overrun) overrun.checked = !!c.preventOverrun;
+            if (rootEarly) rootEarly.checked = !!c.rootEarlyAbort;
             if (seq) seq.checked = (c.mode === 'seq');
             if (mp) mp.checked = (c.mode === 'mp');
             var showW = (c.mode === 'mp');
@@ -155,6 +165,8 @@
             var workers=document.getElementById('cfg-workers');
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
+            var overrun=document.getElementById('cfg-overrun');
+            var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             var run=document.getElementById('cfg-think-now');
@@ -169,6 +181,8 @@
             if (run) run.addEventListener('click', function(){ window.injected_overlayCfgSet({ thinkOnce: true, autoDetect: true }); applyToUi(); try{ if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });
             if (halt) halt.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ halt: true, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });
             if (toggle) toggle.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ collapsed: !window.injected_overlayCfg.collapsed }); }catch(e){} applyToUi(); });
+            if (overrun) overrun.addEventListener('change', function(){ var on = !!overrun.checked; window.injected_overlayCfgSet({ preventOverrun: on }); });
+            if (rootEarly) rootEarly.addEventListener('change', function(){ var on = !!rootEarly.checked; window.injected_overlayCfgSet({ rootEarlyAbort: on }); });
           }catch(e){}
           applyToUi();
         },0);

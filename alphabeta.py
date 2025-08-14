@@ -762,6 +762,11 @@ FUT_WINDOW = 150  # only apply when window is reasonably narrow (score units)
 
 NULL_MOVE_ENABLE=False
 
+# - OVERFLOW_PREVENTION: predict next-depth cost and stop starting a new depth when likely to overrun
+# - ROOT_EARLY_ABORT: experimental root-level early abort within a depth based on per-child time estimates
+OVERFLOW_PREVENTION: bool = True
+ROOT_EARLY_ABORT: bool = False
+
 def move_key_tuple(m):
     # create a hashable key for a move (from,to)
     fr, to = m[0], m[1]
@@ -1079,6 +1084,10 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
     pv_move: Optional[Tuple[Tuple[int,int],Tuple[int,int]]] = None
     last_top_moves: Optional[list] = None
 
+    # Timing/model history for depth scheduling
+    depth_time_hist: List[float] = []  # seconds per completed depth
+    nodes_hist: List[int] = []         # nodes added per completed depth
+
     def _compute_top_moves(k: int = 5):
         moves = state.generate_all_moves()
         scored = []
@@ -1099,13 +1108,32 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
 
     # Time deadline
     deadline = time.perf_counter() + max(0.0, max_time)
+    allowed_deadline = deadline + (0.25 * max(0.0, max_time))
 
     depth = start_depth
+    # Aspiration window parameters (score units: pawn ≈ 10)
+    ASP_INIT = 5.0
+    ASP_MAX = 200.0
+    asp_window = ASP_INIT
     while True:
-        # Time check before starting next depth
+        # Time check + predictive scheduling before starting next depth
         elapsed = time.time() - start_time
-        if time.perf_counter() >= deadline:
+        remaining = max(0.0, (deadline - time.perf_counter()))
+        allowed_remaining = max(0.0, (allowed_deadline - time.perf_counter()))
+        if allowed_remaining <= 0:
             break
+        # Estimate next depth cost with simple growth model; optionally stop if likely to exceed budget
+        if OVERFLOW_PREVENTION and depth_time_hist:
+            if len(depth_time_hist) >= 2:
+                growth = depth_time_hist[-1] / max(1e-6, depth_time_hist[-2])
+            elif len(nodes_hist) >= 2 and nodes_hist[-2] > 0:
+                growth = nodes_hist[-1] / max(1e-6, nodes_hist[-2])
+            else:
+                growth = 2.0
+            growth = min(4.0, max(1.2, float(growth)))
+            predicted_time_for_next = depth_time_hist[-1] * growth
+            if predicted_time_for_next > allowed_remaining * 0.9:
+                break
 
         # Depth start event
         if callable(progress):
@@ -1134,19 +1162,36 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
             is_cap = 1 if meta.get('capture') else 0
             is_prom = 1 if meta.get('promotion') else 0
             is_castle = 1 if meta.get('castle') else 0
-            return (-is_cap, -is_prom, -is_castle)
+            # PV move from previous iteration to the very front
+            is_pv = 0
+            if pv_move is not None and (m[0], m[1]) == pv_move:
+                is_pv = 1
+            return (-is_pv, -is_cap, -is_prom, -is_castle)
 
         ordered = sorted(root_moves, key=_root_key)
 
         root_results = []  # list of (move, val, nodes)
         local_best_move = None
         local_best_val = (-200000 if maximizing else 200000)
+        # Root aspiration window centered at previous best
+        if last_completed_depth >= start_depth and best_move is not None:
+            root_alpha = float(best_val) - asp_window
+            root_beta = float(best_val) + asp_window
+        else:
+            root_alpha, root_beta = -200000.0, 200000.0
 
         try:
             for m in ordered:
-                # Time check before each child
-                # if time.perf_counter() >= deadline:
-                #     raise SearchTimeout()
+                # Time check before each child (experimental root early-abort)
+                if ROOT_EARLY_ABORT:
+                    i = len(root_results)
+                    if i > 0:
+                        elapsed_depth = time.perf_counter() - depth_start_ts
+                        avg_per_child = elapsed_depth / max(1, i)
+                        remaining_children = max(0, len(ordered) - i)
+                        est_remaining = avg_per_child * remaining_children
+                        if (time.perf_counter() + est_remaining) > allowed_deadline:
+                            raise SearchTimeout()
 
                 fr, to, meta = m[0], m[1], m[2]
 
@@ -1165,12 +1210,28 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                 # Search child position with depth-1
                 child_maximizing = (state.turn == 'w')
                 try:
+                    # Use aspiration at the root; if fail-low/high, expand and re-search
+                    use_alpha = root_alpha
+                    use_beta = root_beta
                     val, _bm, child_nodes = alpha_beta(
-                        state, max(0, depth - 1), -200000, 200000,
+                        state, max(0, depth - 1), use_alpha, use_beta,
                         child_maximizing, trans_table, move_stack,
-                        0, 1, killer_moves, history, pv_move=None,
+                        0, 1, killer_moves, history, pv_move=pv_move,
                         deadline=deadline, budget=None
                     )
+                    while (val <= use_alpha or val >= use_beta) and asp_window < ASP_MAX:
+                        asp_window = min(ASP_MAX, asp_window * 2.0)
+                        center = float(best_val) if last_completed_depth >= start_depth else 0.0
+                        use_alpha = center - asp_window
+                        use_beta = center + asp_window
+                        v2, _bm2, n2 = alpha_beta(
+                            state, max(0, depth - 1), use_alpha, use_beta,
+                            child_maximizing, trans_table, move_stack,
+                            0, 1, killer_moves, history, pv_move=pv_move,
+                            deadline=deadline, budget=None
+                        )
+                        val = v2
+                        child_nodes += int(n2 or 0)
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
@@ -1186,6 +1247,10 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                 if better:
                     local_best_val = val
                     local_best_move = m
+                    # Sharpen root window around improving best (still inclusive of previous bounds)
+                    if last_completed_depth >= start_depth and best_move is not None:
+                        root_alpha = max(root_alpha, float(local_best_val) - asp_window)
+                        root_beta = max(root_beta, root_alpha + 1.0)
 
                 # Emit MP-like partial update
                 if callable(progress):
@@ -1220,6 +1285,16 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                 best_val = local_best_val
                 last_completed_depth = depth
                 pv_move = (best_move[0], best_move[1])
+                # Tighten aspiration window again for next depth
+                asp_window = max(ASP_INIT, asp_window / 2.0)
+
+            # Record depth timing and nodes for scheduling model
+            try:
+                depth_time_measured = max(0.0, time.perf_counter() - depth_start_ts)
+                depth_time_hist.append(float(depth_time_measured))
+                nodes_hist.append(max(0, int(nodes_total)))
+            except Exception:
+                pass
 
             # Emit depth_complete with final top list
             if callable(progress):
@@ -1250,10 +1325,10 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                     pass
 
         except SearchTimeout:
-            # Partial results: emit timeout + depth_complete with what we have
+            # Partial results: emit timeout + depth summary with what we have
             if callable(progress):
                 try:
-                    reason = 'time' if time.perf_counter() >= deadline else 'node_budget'
+                    reason = 'time' if time.perf_counter() >= allowed_deadline else 'node_budget'
                     # Emit a timeout event with current best and partial top_moves
                     sorted_partial = sorted(
                         root_results,
@@ -1265,7 +1340,14 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                         for (mm, vv, _nn) in sorted_partial
                     ]
                     last_top_moves = top_moves
-                    progress({'event': 'timeout', 'depth': depth, 'reason': reason, 'top_moves': top_moves})
+                    progress({
+                        'event': 'timeout', 
+                        'depth': depth, 
+                        'reason': reason, 
+                        'best_move': local_best_move or best_move, 
+                        'best_val': local_best_val if local_best_move else best_val, 
+                        'top_moves': top_moves
+                    })
                 except Exception:
                     pass
             break
