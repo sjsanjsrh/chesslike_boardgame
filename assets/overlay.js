@@ -204,7 +204,7 @@
   // Keep overlay clickability and stacking
       window.injected_overlayClickabilityKeepAlive = window.injected_overlayClickabilityKeepAlive || (function(){
         var tid = null;
-        function constrainOverlayWidthToAvoidBoard(){
+    function constrainOverlayWidthToAvoidBoard(){
           try{
             var root = document.getElementById('injected_overlay-root');
             if(!root) return;
@@ -218,18 +218,33 @@
             var board = document.querySelector('wc-chess-board');
             var boardRect = board ? board.getBoundingClientRect() : null;
             var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+            // If board is not detected, release fixed max width so overlay can size naturally
+            if (!boardRect) {
+              // Clear forced widths
+              root.style.maxWidth = '';
+              root.style.width = '';
+              var cfg0 = document.getElementById('injected_overlay-config');
+              var log0 = document.getElementById('injected_overlay-log');
+              if (cfg0){ cfg0.style.maxWidth=''; cfg0.style.width=''; }
+              if (log0){ log0.style.maxWidth=''; log0.style.width=''; }
+              return;
+            }
             // Available gap between board's right edge and viewport right (minus margins)
-            var gapRight = (boardRect ? (vw - margin - boardRect.right) : (vw - margin));
-            var allowed = Math.max(0, Math.floor(gapRight - margin));
+            var gapRight = (vw - margin - boardRect.right);
+      var allowed = Math.max(0, Math.floor(gapRight - margin));
+      // Final fixed width: never exceed allowed; don't let content change it.
+      // Keep a tiny minimum but prefer not to overlap board if very small.
+      var fixedPx = allowed; // strictly cap to avoid crossing into board
 
             // Override min/max widths so we can shrink without overlapping the board
             var cfg = document.getElementById('injected_overlay-config');
             var log = document.getElementById('injected_overlay-log');
-            var px = (allowed > 0 ? allowed : 0);
-            // Apply to root (max width only), and inner panels (min reset + max)
-            root.style.maxWidth = px ? (px + 'px') : '';
-            if (cfg){ cfg.style.minWidth = '0px'; cfg.style.maxWidth = px ? (px + 'px') : ''; }
-            if (log){ log.style.minWidth = '0px'; log.style.maxWidth = px ? (px + 'px') : ''; }
+      var px = (fixedPx > 0 ? fixedPx : 0);
+      // Apply strict width so content doesn't affect it
+      root.style.maxWidth = px ? (px + 'px') : '';
+      root.style.width = px ? (px + 'px') : '';
+      if (cfg){ cfg.style.minWidth = '0px'; cfg.style.maxWidth = px ? (px + 'px') : ''; cfg.style.width = px ? (px + 'px') : ''; }
+      if (log){ log.style.minWidth = '0px'; log.style.maxWidth = px ? (px + 'px') : ''; log.style.width = px ? (px + 'px') : ''; }
           }catch(e){}
         }
         function tick(){
@@ -255,7 +270,11 @@
             constrainOverlayWidthToAvoidBoard();
           }catch(e){}
         }
-        if (!tid){ tick(); tid = window.setInterval(tick, 500); }
+        if (!tid){
+          tick();
+          tid = window.setInterval(tick, 500);
+          try{ window.addEventListener('resize', tick, { passive: true }); }catch(e){}
+        }
         return function(){ tick(); };
       })();
 
