@@ -1469,7 +1469,7 @@ def main():
     URL = "https://www.chess.com/ko/play/computer"
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1000, "height": 720})
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
         try:
             # Register init assets at context-level before creating any pages
             _register_init_assets(context)
