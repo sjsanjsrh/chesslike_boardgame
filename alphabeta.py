@@ -1,220 +1,135 @@
 from typing import List, Tuple, Dict, Optional, Callable
 import math, time
-import multiprocessing
 
 # Updated values based on modern chess theory (Kaufman 2021 system scaled by 10)
 # Standard ratios: P=1, N=3.2, B=3.3, R=5.3, Q=9.4
 PIECE_VALUES = {'K':200,'Q':94,'R':53,'B':33,'N':32,'P':10}
 
 # ---------------------
-# Piece classes (standard pieces only)
+# Table-based piece representation
 # ---------------------
-class Piece:
-    def __init__(self, side: str, name: str):
-        self.side = side  # 'w' or 'b'
-        self.name = name  # 'K','Q','R','N','B','P'
+# Codes: 0 empty; 1..6 white (P,N,B,R,Q,K), 9..14 black (p,n,b,r,q,k)
+EMPTY = 0
+W_P, W_N, W_B, W_R, W_Q, W_K = 1, 2, 3, 4, 5, 6
+B_P, B_N, B_B, B_R, B_Q, B_K = 9, 10, 11, 12, 13, 14
 
-    def __repr__(self):
-        return f"{self.side}{self.name}"
+_CODE_TO_NAME = {
+    W_P:'P', W_N:'N', W_B:'B', W_R:'R', W_Q:'Q', W_K:'K',
+    B_P:'P', B_N:'N', B_B:'B', B_R:'R', B_Q:'Q', B_K:'K',
+}
+_CODE_TO_SIDE = {
+    W_P:'w', W_N:'w', W_B:'w', W_R:'w', W_Q:'w', W_K:'w',
+    B_P:'b', B_N:'b', B_B:'b', B_R:'b', B_Q:'b', B_K:'b',
+}
 
-    def get_moves(self, r: int, c: int, state) -> List[Tuple[int,int, dict]]:
-        return []
+def code_side(code: int) -> Optional[str]:
+    return _CODE_TO_SIDE.get(code)
+
+def code_name(code: int) -> Optional[str]:
+    return _CODE_TO_NAME.get(code)
+
+def is_white_code(code: int) -> bool:
+    return 1 <= code <= 6
+
+def is_black_code(code: int) -> bool:
+    return 9 <= code <= 14
 
 def on_board(r,c):
     return 0 <= r < 8 and 0 <= c < 8
 
-def generate_sliding_moves(r,c,state,deltas):
+# --- Move generation helpers (table-based) ---
+def _gen_sliding(board, r, c, side: str, deltas: List[Tuple[int,int]]):
     moves=[]
     for dr,dc in deltas:
         nr,nc=r+dr,c+dc
         while on_board(nr,nc):
-            t = state.board[nr][nc]
-            if t is None:
+            t = board[nr][nc]
+            if t == EMPTY:
                 moves.append((nr,nc,{}))
             else:
-                if t.side != state.turn:
+                if (side=='w' and is_black_code(t)) or (side=='b' and is_white_code(t)):
                     moves.append((nr,nc,{'capture': True}))
                 break
             nr+=dr; nc+=dc
     return moves
 
-class Rook(Piece):
-    def __init__(self, side): super().__init__(side,'R')
-    def get_moves(self,r,c,state):
-        return generate_sliding_moves(r,c,state,[(1,0),(-1,0),(0,1),(0,-1)])
+def _gen_knight(board, r, c, side: str):
+    moves=[]
+    for dr,dc in [(2,1),(1,2),(-1,2),(-2,1),(-2,-1),(-1,-2),(1,-2),(2,-1)]:
+        nr,nc=r+dr,c+dc
+        if on_board(nr,nc):
+            t=board[nr][nc]
+            if t==EMPTY or ((side=='w' and is_black_code(t)) or (side=='b' and is_white_code(t))):
+                moves.append((nr,nc,{'capture': t!=EMPTY}))
+    return moves
 
-class Bishop(Piece):
-    def __init__(self, side): super().__init__(side,'B')
-    def get_moves(self,r,c,state):
-        return generate_sliding_moves(r,c,state,[(1,1),(1,-1),(-1,1),(-1,-1)])
-
-class Queen(Piece):
-    def __init__(self, side): super().__init__(side,'Q')
-    def get_moves(self,r,c,state):
-        return generate_sliding_moves(r,c,state,[(1,0),(-1,0),(0,1),(0,-1),
-                                                 (1,1),(1,-1),(-1,1),(-1,-1)])
-
-class Knight(Piece):
-    def __init__(self, side): super().__init__(side,'N')
-    def get_moves(self,r,c,state):
-        moves=[]
-        for dr,dc in [(2,1),(1,2),(-1,2),(-2,1),(-2,-1),(-1,-2),(1,-2),(2,-1)]:
+def _gen_king(board, r, c, side: str, state) -> List[Tuple[int,int,dict]]:
+    moves=[]
+    for dr in (-1,0,1):
+        for dc in (-1,0,1):
+            if dr==0 and dc==0: continue
             nr,nc=r+dr,c+dc
             if on_board(nr,nc):
-                t=state.board[nr][nc]
-                if t is None or t.side!=self.side:
-                    moves.append((nr,nc,{'capture': t is not None}))
-        return moves
+                t=board[nr][nc]
+                if t==EMPTY or ((side=='w' and is_black_code(t)) or (side=='b' and is_white_code(t))):
+                    moves.append((nr,nc,{'capture': t!=EMPTY}))
+    # Castling with basic checks including attacked squares
+    if c==4:
+        rights = state.castle_check[side]
+        enemy = 'b' if side=='w' else 'w'
+        # kingside
+        if rights[1] and c+3<8:
+            if board[r][c+1]==EMPTY and board[r][c+2]==EMPTY:
+                rook = board[r][c+3]
+                if code_name(rook)=='R' and code_side(rook)==side:
+                    if not (state.is_under_attack(r,c,enemy) or state.is_under_attack(r,c+1,enemy) or state.is_under_attack(r,c+2,enemy)):
+                        moves.append((r,c+2,{'castle':'kingside'}))
+        # queenside
+        if rights[0] and c-4>=0:
+            if board[r][c-1]==EMPTY and board[r][c-2]==EMPTY and board[r][c-3]==EMPTY:
+                rook = board[r][c-4]
+                if code_name(rook)=='R' and code_side(rook)==side:
+                    if not (state.is_under_attack(r,c,enemy) or state.is_under_attack(r,c-1,enemy) or state.is_under_attack(r,c-2,enemy)):
+                        moves.append((r,c-2,{'castle':'queenside'}))
+    return moves
 
-class King(Piece):
-    def __init__(self, side): super().__init__(side,'K')
-    def get_moves(self,r,c,state):
-        moves=[]
-        for dr in (-1,0,1):
-            for dc in (-1,0,1):
-                if dr==0 and dc==0: continue
-                nr,nc=r+dr,c+dc
-                if on_board(nr,nc):
-                    t=state.board[nr][nc]
-                    if t is None or t.side!=self.side:
-                        moves.append((nr,nc,{'capture': t is not None}))
-        
-        # Add castling moves
-        castling_moves = self.get_castling_moves(r, c, state)
-        moves.extend(castling_moves)
-        
-        return moves
-    
-    def get_castling_moves(self, r, c, state):
-        moves = []
-        
-        # 킹이 초기 위치 4번 컬럼에 있는지만 체크 (랭크는 상관없이)
-        if c != 4:
-            return moves
-        
-        # Check if king has moved (simplified check based on position and castle_check)
-        if not state.castle_check[self.side][0] and not state.castle_check[self.side][1]:
-            return moves
-            
-        # Check kingside castling (short castling)
-        if state.castle_check[self.side][1]:  # kingside castle allowed
-            if self.can_castle_kingside(r, c, state):
-                moves.append((r, c+2, {'castle': 'kingside'}))
-        
-        # Check queenside castling (long castling)
-        if state.castle_check[self.side][0]:  # queenside castle allowed
-            if self.can_castle_queenside(r, c, state):
-                moves.append((r, c-2, {'castle': 'queenside'}))
-        
-        return moves
-    
-    def can_castle_kingside(self, r, c, state):
-        # 킹의 현재 위치를 기준으로 상대적 위치 체크
-        # Check if squares between king and rook are empty (킹 우측 1칸, 2칸)
-        if c + 2 >= 8:  # 보드 범위 체크
-            return False
-        square1 = state.board[r][c+1]
-        square2 = state.board[r][c+2]
-        if square1 is not None or square2 is not None:
-            return False
-        # Check if rook is in correct position (킹 우측 3칸)
-        if c + 3 >= 8:
-            return False
-        rook = state.board[r][c+3]
-        if rook is None or rook.name != 'R' or rook.side != self.side:
-            return False
-        # 공격 중인지 확인(현재/통과/도착 칸)
-        enemy = 'b' if self.side == 'w' else 'w'
-        if (state.is_under_attack(r, c, enemy) or
-            state.is_under_attack(r, c+1, enemy) or
-            state.is_under_attack(r, c+2, enemy)):
-            return False
-        return True
-
-    def can_castle_queenside(self, r, c, state):
-        # 킹의 현재 위치를 기준으로 상대적 위치 체크
-        if c - 3 < 0:
-            return False
-        square1 = state.board[r][c-1]
-        square2 = state.board[r][c-2]
-        square3 = state.board[r][c-3]
-        if (square1 is not None or square2 is not None or square3 is not None):
-            return False
-        if c - 4 < 0:
-            return False
-        rook = state.board[r][c-4]
-        if rook is None or rook.name != 'R' or rook.side != self.side:
-            return False
-        enemy = 'b' if self.side == 'w' else 'w'
-        if (state.is_under_attack(r, c, enemy) or
-            state.is_under_attack(r, c-1, enemy) or
-            state.is_under_attack(r, c-2, enemy)):
-            return False
-        return True
-
-class Pawn(Piece):
-    def __init__(self, side): super().__init__(side,'P')
-    def get_moves(self,r,c,state):
-        moves=[]
-        # White moves up the board (towards row decreasing), Black moves down (row increasing)
-        dir = -1 if self.side == 'w' else 1
-        nr, nc = r + dir, c
-
-        # Promotion row (white at row 0, black at row 7)
-        promotion_row = 0 if self.side == 'w' else 7
-
-        # Forward moves
-        if on_board(nr,nc) and state.board[nr][nc] is None:
-            if nr == promotion_row:
-                moves.append((nr,nc,{'promotion': True}))
-            else:
-                moves.append((nr,nc,{}))
-            # Double push from starting rank
-            start_row = 6 if self.side == 'w' else 1
+def _gen_pawn(board, r, c, side: str, state) -> List[Tuple[int,int,dict]]:
+    moves=[]
+    dir = -1 if side=='w' else 1
+    start_row = 6 if side=='w' else 1
+    promotion_row = 0 if side=='w' else 7
+    nr = r + dir
+    # forward 1
+    if on_board(nr,c) and board[nr][c]==EMPTY:
+        meta={}
+        if nr == promotion_row:
+            meta['promotion']=True
+        moves.append((nr,c,meta))
+        # forward 2
+        if r==start_row and board[r+dir][c]==EMPTY:
             nr2 = r + 2*dir
-            if r == start_row and on_board(nr2,nc) and state.board[nr2][nc] is None:
-                moves.append((nr2,nc,{'double_pawn_push': True}))
-
-        # Diagonal captures
-        for dc in (-1, 1):
-            nr, nc = r + dir, c + dc
-            if on_board(nr,nc):
-                t = state.board[nr][nc]
-                if t is not None and t.side != self.side:
-                    if nr == promotion_row:
-                        moves.append((nr,nc, {'capture': True, 'promotion': True}))
-                    else:
-                        moves.append((nr,nc, {'capture': True}))
-
-        # En passant captures
-        en_passant_moves = self.get_en_passant_moves(r, c, state)
-        moves.extend(en_passant_moves)
-
-        return moves
-
-    def get_en_passant_moves(self, r, c, state):
-        moves = []
-        
-        if state.en_passant_target is None:
-            return moves
-        
-        target_r, target_c = state.en_passant_target
-        dir = -1 if self.side == 'w' else 1
-        
-        # Check if we can capture en passant
-        # The target square should be one rank ahead of us and one file to the side
+            if board[nr2][c]==EMPTY:
+                moves.append((nr2,c,{'double_pawn_push': True}))
+    # captures
+    for dc in (-1,1):
+        nc=c+dc
+        nr=r+dir
+        if on_board(nr,nc):
+            t=board[nr][nc]
+            if t!=EMPTY and ((side=='w' and is_black_code(t)) or (side=='b' and is_white_code(t))):
+                meta={'capture': True}
+                if nr == promotion_row:
+                    meta['promotion']=True
+                moves.append((nr,nc,meta))
+    # en passant
+    ep = state.en_passant_target
+    if ep is not None:
+        target_r, target_c = ep
         if r + dir == target_r and abs(c - target_c) == 1:
-            # The enemy pawn should be on the same rank as us, at the target column
-            enemy_pawn = state.board[r][target_c]
-            if (enemy_pawn is not None and enemy_pawn.name == 'P' and 
-                enemy_pawn.side != self.side):
-                moves.append((target_r, target_c, {'en_passant': True}))
-        
-        return moves
-
-    def get_promotion_piece(self):
-        # Pawn은 오직 Queen으로만 진급
-        return Queen(self.side)
+            enemy_pawn = board[r][target_c]
+            if code_name(enemy_pawn) == 'P' and code_side(enemy_pawn) != side:
+                moves.append((target_r, target_c, {'en_passant': True, 'capture': True}))
+    return moves
 
 # ---------------------
 # Game State
@@ -242,50 +157,42 @@ def emit_castling_rights(m: int) -> str:
 
 class GameState:
     def __init__(self):
-        self.board = [[None]*8 for _ in range(8)]
+        self.board = [[EMPTY]*8 for _ in range(8)]
         self.turn = 'w'
         self.captured = {'w': [], 'b': []}
         self.move_count = 0
-        self.castle_check={'w': [True,True], 'b': [True,True]}
-        self.en_passant_target = None  # (row, col) of en passant target square
-        
+        self.castle_check = {'w': [True, True], 'b': [True, True]}
+        self.en_passant_target = None  # (row, col)
+
         # King position tracking for check detection
-        self.w_king_pos = (7, 4)  # Initial position: e1
-        self.b_king_pos = (0, 4)  # Initial position: e8
-        
-        # Castling rights tracking
-        self.w_castling_rights = [True, True]  # [queenside, kingside]
-        self.b_castling_rights = [True, True]  # [queenside, kingside]
-        
-        # Move counters for fifty-move rule and game notation
+        self.w_king_pos = (7, 4)  # e1
+        self.b_king_pos = (0, 4)  # e8
+
+        # Castling rights tracking (redundant to castle_check but kept)
+        self.w_castling_rights = [True, True]
+        self.b_castling_rights = [True, True]
+
+        # Move counters
         self.halfmove_clock = 0
         self.fullmove_number = 1
-        
+
         # KQkq 권리 통합 비트마스크 (기본: 모두 가능)
-        self.castling_rights: int = (CR_WK | CR_WQ | CR_BK | CR_BQ)
-        
+        self.castling_rights = (CR_WK | CR_WQ | CR_BK | CR_BQ)
+
         # Initialize the board with starting position
         self._initialize_board()
     
     def _initialize_board(self):
         """Set up the initial chess board position"""
         # b pieces (top of board, row 0-1)
-        self.board[0] = [
-            Rook('b'), Knight('b'), Bishop('b'), Queen('b'),
-            King('b'), Bishop('b'), Knight('b'), Rook('b')
-        ]
-        self.board[1] = [Pawn('b') for _ in range(8)]
-        
+        self.board[0] = [B_R, B_N, B_B, B_Q, B_K, B_B, B_N, B_R]
+        self.board[1] = [B_P for _ in range(8)]
         # Empty squares (rows 2-5)
         for row in range(2, 6):
-            self.board[row] = [None for _ in range(8)]
-        
+            self.board[row] = [EMPTY for _ in range(8)]
         # w pieces (bottom of board, row 6-7)
-        self.board[6] = [Pawn('w') for _ in range(8)]
-        self.board[7] = [
-            Rook('w'), Knight('w'), Bishop('w'), Queen('w'),
-            King('w'), Bishop('w'), Knight('w'), Rook('w')
-        ]
+        self.board[6] = [W_P for _ in range(8)]
+        self.board[7] = [W_R, W_N, W_B, W_Q, W_K, W_B, W_N, W_R]
 
     def apply_move(self, from_rc: Tuple[int,int], to_rc: Tuple[int,int], metadata: dict, move_stack: list):
         fr,fc = from_rc
@@ -308,14 +215,14 @@ class GameState:
             if castle_type == 'kingside':
                 # Move rook for kingside castling
                 rook = self.board[fr][fc+3]
-                self.board[fr][fc+1] = rook  # Rook moves to f1/f8
-                self.board[fr][fc+3] = None
+                self.board[fr][fc+1] = rook  # f-file
+                self.board[fr][fc+3] = EMPTY
                 undo_rec['castle_info'] = {'type': 'kingside', 'rook_from': (fr, fc+3), 'rook_to': (fr, fc+1)}
             elif castle_type == 'queenside':
                 # Move rook for queenside castling
                 rook = self.board[fr][fc-4]
-                self.board[fr][fc-1] = rook  # Rook moves to d1/d8
-                self.board[fr][fc-4] = None
+                self.board[fr][fc-1] = rook  # d-file
+                self.board[fr][fc-4] = EMPTY
                 undo_rec['castle_info'] = {'type': 'queenside', 'rook_from': (fr, fc-4), 'rook_to': (fr, fc-1)}
         
         # Handle en passant
@@ -325,48 +232,48 @@ class GameState:
             enemy_pawn_col = tc
             enemy_pawn = self.board[enemy_pawn_row][enemy_pawn_col]
             if enemy_pawn:
-                self.captured[enemy_pawn.side].append(enemy_pawn)
-                self.board[enemy_pawn_row][enemy_pawn_col] = None
+                self.captured[code_side(enemy_pawn)].append(enemy_pawn)
+                self.board[enemy_pawn_row][enemy_pawn_col] = EMPTY
                 undo_rec['en_passant_captured'] = enemy_pawn
         
         # Reset en passant target (will be set again if needed)
         self.en_passant_target = None
         
         # Set en passant target for double pawn pushes
-        if moving.name == 'P' and metadata.get('double_pawn_push'):
+        if code_name(moving) == 'P' and metadata.get('double_pawn_push'):
             # Set en passant target square behind the pawn
             ep_target_row = (fr + tr) // 2  # Middle square
             ep_target_col = fc
             self.en_passant_target = (ep_target_row, ep_target_col)
         
         # Update castle rights when king or rook moves
-        if moving.name == 'K':
+        if code_name(moving) == 'K':
             # King moved - lose all castling rights
-            self.castle_check[moving.side] = [False, False]
-        elif moving.name == 'R':
+            self.castle_check[code_side(moving)] = [False, False]
+        elif code_name(moving) == 'R':
             # Rook moved - lose castling rights for that side
             if fr == 0 or fr == 7:  # Starting rank for rook
                 if fc == 0:  # Queenside rook
-                    self.castle_check[moving.side][0] = False
+                    self.castle_check[code_side(moving)][0] = False
                 elif fc == 7:  # Kingside rook
-                    self.castle_check[moving.side][1] = False
+                    self.castle_check[code_side(moving)][1] = False
         
         # Capture rook affects castling rights
-        if captured is not None:
-            if captured.name == 'R':
+        if captured is not None and captured != EMPTY:
+            if code_name(captured) == 'R':
                 if tr == 0 or tr == 7:  # Starting rank
                     if tc == 0:  # Queenside rook captured
-                        self.castle_check[captured.side][0] = False
+                        self.castle_check[code_side(captured)][0] = False
                     elif tc == 7:  # Kingside rook captured
-                        self.castle_check[captured.side][1] = False
-            self.captured[captured.side].append(captured)
+                        self.castle_check[code_side(captured)][1] = False
+            self.captured[code_side(captured)].append(captured)
         
         self.board[tr][tc] = moving
-        self.board[fr][fc] = None
+        self.board[fr][fc] = EMPTY
         
         # Update king positions
-        if moving.name == 'K':  # If a king moved
-            if moving.side == 'w':
+        if code_name(moving) == 'K':  # If a king moved
+            if code_side(moving) == 'w':
                 undo_rec['prev_w_king_pos'] = self.w_king_pos
                 self.w_king_pos = (tr, tc)
             else:
@@ -374,16 +281,16 @@ class GameState:
                 self.b_king_pos = (tr, tc)
         
         # Handle pawn promotion
-        if moving.name == 'P':
-            promotion_row = 7 if moving.side == 'w' else 0
+        if code_name(moving) == 'P':
+            promotion_row = 7 if code_side(moving) == 'w' else 0
             if (tr == promotion_row) and metadata.get('promotion'):
                 undo_rec['promoted_from'] = moving
-                self.board[tr][tc] = moving.get_promotion_piece()
+                self.board[tr][tc] = (W_Q if code_side(moving)=='w' else B_Q)
             else:
                 # 기존 코드와 호환 (혹시 promotion meta가 없는 경우)
-                if (moving.side == 'w' and tr == 0) or (moving.side == 'b' and tr == 7):
+                if (code_side(moving) == 'w' and tr == 0) or (code_side(moving) == 'b' and tr == 7):
                     undo_rec['promoted_from'] = moving
-                    self.board[tr][tc] = Queen(moving.side)
+                    self.board[tr][tc] = (W_Q if code_side(moving)=='w' else B_Q)
 
         move_stack.append(undo_rec)
 
@@ -417,7 +324,7 @@ class GameState:
             rook_to = castle_info['rook_to']
             rook = self.board[rook_to[0]][rook_to[1]]
             self.board[rook_from[0]][rook_from[1]] = rook
-            self.board[rook_to[0]][rook_to[1]] = None
+            self.board[rook_to[0]][rook_to[1]] = EMPTY
         
         # Handle en passant undo
         if u.get('en_passant_captured'):
@@ -427,43 +334,48 @@ class GameState:
             enemy_pawn_row = u['fr'][0]
             enemy_pawn_col = u['to'][1]
             self.board[enemy_pawn_row][enemy_pawn_col] = enemy_pawn
-            self.captured[enemy_pawn.side].pop()
+            self.captured[code_side(enemy_pawn)].pop()
         
         if u['promoted_from'] is not None:
             self.board[u['to'][0]][u['to'][1]] = u['promoted_from']
         moving = self.board[u['to'][0]][u['to'][1]]
         self.board[u['fr'][0]][u['fr'][1]] = moving
-        self.board[u['to'][0]][u['to'][1]] = u['captured']
-        if u['captured'] is not None:
-            self.captured[u['captured'].side].pop()
+        self.board[u['to'][0]][u['to'][1]] = u['captured'] if u['captured'] is not None else EMPTY
+        if u['captured'] is not None and u['captured'] != EMPTY:
+            self.captured[code_side(u['captured'])].pop()
         self.turn = 'b' if self.turn == 'w' else 'w'
         self.move_count -= 1
 
 
     def generate_all_moves(self, skip_castling: bool = False):
         moves=[]
+        side = self.turn
         for r in range(8):
             for c in range(8):
-                p = self.board[r][c]
-                if p is None:
+                code = self.board[r][c]
+                if code == EMPTY:
                     continue
-                
-                if p.side != self.turn:
+                if code_side(code) != side:
                     continue
-                    
-                if p.name == 'K' and skip_castling:
-                    # Get king moves without castling
-                    for dr in (-1,0,1):
-                        for dc in (-1,0,1):
-                            if dr==0 and dc==0: continue
-                            nr,nc=r+dr,c+dc
-                            if on_board(nr,nc):
-                                t=self.board[nr][nc]
-                                if t is None or (t.side != p.side):
-                                    moves.append(((r,c),(nr,nc),{'capture': t is not None},p))
+                name = code_name(code)
+                if name == 'K':
+                    gen = _gen_king(self.board, r, c, side, self)
+                    if skip_castling:
+                        gen = [ (nr,nc,{k:v for k,v in meta.items() if k!='castle'}) for (nr,nc,meta) in gen ]
+                elif name == 'Q':
+                    gen = _gen_sliding(self.board, r, c, side, [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)])
+                elif name == 'R':
+                    gen = _gen_sliding(self.board, r, c, side, [(1,0),(-1,0),(0,1),(0,-1)])
+                elif name == 'B':
+                    gen = _gen_sliding(self.board, r, c, side, [(1,1),(1,-1),(-1,1),(-1,-1)])
+                elif name == 'N':
+                    gen = _gen_knight(self.board, r, c, side)
+                elif name == 'P':
+                    gen = _gen_pawn(self.board, r, c, side, self)
                 else:
-                    for nr,nc,meta in p.get_moves(r,c,self):
-                        moves.append(((r,c),(nr,nc),meta,p))
+                    gen = []
+                for nr,nc,meta in gen:
+                    moves.append(((r,c),(nr,nc),meta))
         return moves
 
     def zobrist_hash(self) -> str:
@@ -475,11 +387,11 @@ class GameState:
         for r in range(8):
             row = []
             for c in range(8):
-                p = self.board[r][c]
-                if p is None:
+                code = self.board[r][c]
+                if not code or code == EMPTY:
                     row.append('.')
                 else:
-                    row.append(f"{p.side}{p.name}")
+                    row.append(f"{code_side(code)}{code_name(code)}")
             rows.append(''.join(row))
 
         # Encode castling rights from current rights tracker
@@ -505,34 +417,29 @@ class GameState:
         """Check if the given side is in check"""
         if side is None:
             side = self.turn
-        
-        # Find the king
-        king_pos = None
-        for r in range(8):
-            for c in range(8):
-                piece = self.board[r][c]
-                if piece and piece.name == 'K' and piece.side == side:
-                    king_pos = (r, c)
+        # Get king position from tracked state
+        king_pos = self.w_king_pos if side=='w' else self.b_king_pos
+        if not king_pos:
+            # Fallback: scan
+            for r in range(8):
+                for c in range(8):
+                    code = self.board[r][c]
+                    if code_name(code) == 'K' and code_side(code) == side:
+                        king_pos = (r,c)
+                        break
+                if king_pos:
                     break
-            if king_pos:
-                break
-        
         if not king_pos:
             return False  # No king found
-        
-        # Check if any enemy piece can attack the king
+        # Check if any enemy piece can attack the king (baseline path)
         enemy_side = 'b' if side == 'w' else 'w'
         orig_turn = self.turn
         self.turn = enemy_side
-        
-        # Generate moves but skip castling to avoid recursion
         enemy_moves = self.generate_all_moves(skip_castling=True)
         self.turn = orig_turn
-        
         for move in enemy_moves:
-            if move[1] == king_pos:  # Enemy can capture king
+            if move[1] == king_pos:
                 return True
-        
         return False
 
     def gives_check(self, from_sq, to_sq, meta):
@@ -543,19 +450,14 @@ class GameState:
         return in_check
 
     def is_under_attack(self, row: int, col: int, attacking_side: str) -> bool:
-        """Check if a square is under attack by a given side"""
+        """Check if a square is under attack by a given side (baseline implementation)."""
         orig_turn = self.turn
         self.turn = attacking_side
-        
-        # Generate moves for the attacking side
         moves = self.generate_all_moves(skip_castling=True)
         self.turn = orig_turn
-        
-        # Check if any move targets the given square
         for move in moves:
             if move[1] == (row, col):
                 return True
-        
         return False
     
     def is_checkmate(self) -> bool:
@@ -597,7 +499,8 @@ class GameState:
             self.apply_move(move[0], move[1], move[2], move_stack)
             
             # Check if this puts us in check (illegal move)
-            in_check = self.is_in_check(move[3].side)
+            moving_side = 'b' if self.turn == 'w' else 'w'  # side that just moved
+            in_check = self.is_in_check(moving_side)
             
             # Undo the move
             self.undo_move(move_stack)
@@ -675,18 +578,18 @@ class GameState:
 
         for r in range(8):
             for c in range(8):
-                piece = self.board[r][c]
-                if piece is None:
+                code = self.board[r][c]
+                if not code or code == EMPTY:
                     continue
-
-                name = piece.name.upper()
+                name = code_name(code)
+                side = code_side(code)
                 if name == 'Q':
-                    if piece.side == 'w':
+                    if side == 'w':
                         white_queens += 1
                     else:
                         black_queens += 1
                 elif name in PIECE_VALUES_SIMPLE:
-                    if piece.side == 'w':
+                    if side == 'w':
                         white_minor_major_score += PIECE_VALUES_SIMPLE[name]
                     else:
                         black_minor_major_score += PIECE_VALUES_SIMPLE[name]
@@ -774,24 +677,26 @@ def _build_bitboards(state: GameState) -> Dict[str, int]:
     }
     for r in range(8):
         for c in range(8):
-            p = state.board[r][c]
-            if not p:
+            code = state.board[r][c]
+            if not code or code == EMPTY:
                 continue
             bit = 1 << _sq_index(r,c)
-            if p.side == 'w':
-                if p.name == 'P': bb['WP'] |= bit
-                elif p.name == 'N': bb['WN'] |= bit
-                elif p.name == 'B': bb['WB'] |= bit
-                elif p.name == 'R': bb['WR'] |= bit
-                elif p.name == 'Q': bb['WQ'] |= bit
-                elif p.name == 'K': bb['WK'] |= bit
+            side = code_side(code)
+            name = code_name(code)
+            if side == 'w':
+                if name == 'P': bb['WP'] |= bit
+                elif name == 'N': bb['WN'] |= bit
+                elif name == 'B': bb['WB'] |= bit
+                elif name == 'R': bb['WR'] |= bit
+                elif name == 'Q': bb['WQ'] |= bit
+                elif name == 'K': bb['WK'] |= bit
             else:
-                if p.name == 'P': bb['BP'] |= bit
-                elif p.name == 'N': bb['BN'] |= bit
-                elif p.name == 'B': bb['BB'] |= bit
-                elif p.name == 'R': bb['BR'] |= bit
-                elif p.name == 'Q': bb['BQ'] |= bit
-                elif p.name == 'K': bb['BK'] |= bit
+                if name == 'P': bb['BP'] |= bit
+                elif name == 'N': bb['BN'] |= bit
+                elif name == 'B': bb['BB'] |= bit
+                elif name == 'R': bb['BR'] |= bit
+                elif name == 'Q': bb['BQ'] |= bit
+                elif name == 'K': bb['BK'] |= bit
     bb['W'] = bb['WP']|bb['WN']|bb['WB']|bb['WR']|bb['WQ']|bb['WK']
     bb['B'] = bb['BP']|bb['BN']|bb['BB']|bb['BR']|bb['BQ']|bb['BK']
     bb['ALL'] = bb['W'] | bb['B']
@@ -1046,10 +951,15 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
             else:
                 tr, tc = m[1]
                 victim = state.board[tr][tc]
-                if victim:
-                    score += values.get(victim.name, 0) * 100
-                    if len(m) > 3:
-                        score -= values.get(m[3].name, 0)
+                if victim and victim != EMPTY:
+                    vname = code_name(victim)
+                    score += values.get(vname, 0) * 100
+                    # MVV-LVA approximate attacker value
+                    fr, fc = m[0]
+                    attacker = state.board[fr][fc]
+                    aname = code_name(attacker)
+                    if aname:
+                        score -= values.get(aname, 0)
         elif killer_moves is not None and ply < len(killer_moves):
             mk = (m[0], m[1])
             if killer_moves[ply][0] and mk == killer_moves[ply][0]:
@@ -1081,7 +991,7 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     if static_eval is not None and static_eval + FUT_MAX_GAIN <= alpha:
                         continue
             fr_r, fr_c = m[0]
-            if state.board[fr_r][fr_c] is None:
+            if state.board[fr_r][fr_c] == EMPTY:
                 continue
             moving_side = state.turn
             state.apply_move(m[0], m[1], meta, move_stack)
@@ -1150,7 +1060,7 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     if static_eval is not None and static_eval - FUT_MAX_GAIN >= beta:
                         continue
             fr_r, fr_c = m[0]
-            if state.board[fr_r][fr_c] is None:
+            if state.board[fr_r][fr_c] == EMPTY:
                 continue
             moving_side = state.turn
             state.apply_move(m[0], m[1], meta, move_stack)
@@ -1262,7 +1172,7 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
         for m in moves:
             fr, to, meta = m[0], m[1], m[2]
             fr_r, fr_c = fr
-            if state.board[fr_r][fr_c] is None:
+            if state.board[fr_r][fr_c] == EMPTY:
                 continue
             state.apply_move(fr, to, meta, move_stack)
             try:
@@ -1365,7 +1275,7 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
 
                 # Skip stale move if from-square empty
                 fr_r, fr_c = fr
-                if state.board[fr_r][fr_c] is None:
+                if state.board[fr_r][fr_c] == EMPTY:
                     continue
 
                 moving_side = state.turn
@@ -1578,24 +1488,24 @@ def print_board(state: GameState):
         rank = 8 - r
         rowstr = f"{rank} "
         for c in range(8):
-            p = state.board[r][c]
-            if p is None:
+            code = state.board[r][c]
+            if not code or code == EMPTY:
                 rowstr += '. '
             else:
-                sym = p.name.upper() if p.side=='w' else p.name.lower()
+                name = code_name(code)
+                side = code_side(code)
+                sym = name.upper() if side=='w' else name.lower()
                 rowstr += sym + ' '
         print(rowstr)
     print()
-    print(f"Turn: {state.turn} | Captured W: {[p.name for p in state.captured['w']]} | Captured B: {[p.name for p in state.captured['b']]}\n")
+    cap_w = [code_name(x) for x in state.captured['w']]
+    cap_b = [code_name(x) for x in state.captured['b']]
+    print(f"Turn: {state.turn} | Captured W: {cap_w} | Captured B: {cap_b}\n")
 
 def fen_to_board(fen: str):
     piece_map = {
-        'K': lambda: King('w'), 'Q': lambda: Queen('w'),
-        'R': lambda: Rook('w'), 'B': lambda: Bishop('w'),
-        'N': lambda: Knight('w'), 'P': lambda: Pawn('w'),
-        'k': lambda: King('b'), 'q': lambda: Queen('b'),
-        'r': lambda: Rook('b'), 'b': lambda: Bishop('b'),
-        'n': lambda: Knight('b'), 'p': lambda: Pawn('b'),
+        'K': W_K, 'Q': W_Q, 'R': W_R, 'B': W_B, 'N': W_N, 'P': W_P,
+        'k': B_K, 'q': B_Q, 'r': B_R, 'b': B_B, 'n': B_N, 'p': B_P,
     }
     rows = fen.split()[0].split('/')  # FEN lists ranks from 8 -> 1; row 0 = rank 8
     board = []
@@ -1603,9 +1513,9 @@ def fen_to_board(fen: str):
         br = []
         for ch in row:
             if ch.isdigit():
-                br.extend([None]*int(ch))
+                br.extend([EMPTY]*int(ch))
             else:
-                br.append(piece_map[ch]())
+                br.append(piece_map[ch])
         board.append(br)
     return board
 
