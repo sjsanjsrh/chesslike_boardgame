@@ -266,35 +266,6 @@ class GameState:
         
         # Initialize the board with starting position
         self._initialize_board()
-
-    # --- Null move helpers for pruning ---
-    def do_null_move(self, move_stack: list):
-        """Apply a null move (pass turn). Clears en passant as per rules.
-        Records minimal info in move_stack for undo.
-        """
-        undo_rec = {
-            'null_move': True,
-            'prev_en_passant_target': self.en_passant_target,
-        }
-        move_stack.append(undo_rec)
-        # per rules, EP target clears when a side passes a move
-        self.en_passant_target = None
-        # toggle turn and increment move count
-        self.turn = 'b' if self.turn == 'w' else 'w'
-        self.move_count += 1
-
-    def undo_null_move(self, move_stack: list):
-        if not move_stack:
-            return
-        u = move_stack.pop()
-        if not u.get('null_move'):
-            # If last record wasn't a null move, put it back and do nothing
-            move_stack.append(u)
-            return
-        # revert turn and move count
-        self.turn = 'b' if self.turn == 'w' else 'w'
-        self.move_count -= 1
-        self.en_passant_target = u.get('prev_en_passant_target')
     
     def _initialize_board(self):
         """Set up the initial chess board position"""
@@ -635,7 +606,102 @@ class GameState:
                 return False  # Found a legal move
         
         return True  # No legal moves = stalemate
+    def apply_null_move(self, move_stack):
+        """
+        Null move: 아무 수를 두지 않고 턴을 넘김.
+        현재 상태를 move_stack에 저장해 두었다가 undo_null_move로 복원 가능.
+        """
+        # 현재 상태 저장
+        state_snapshot = {
+            "turn": self.turn,
+            "halfmove_clock": self.halfmove_clock,
+            "fullmove_number": self.fullmove_number,
+            "zobrist": self.zobrist_hash(),  # 복구 시 참고
+            # 필요 시 캐슬 권리, 앙파상 가능성 등 추가
+            "castle_rights": self.castle_rights.copy() if hasattr(self, "castle_rights") else None,
+            "en_passant": self.en_passant if hasattr(self, "en_passant") else None
+        }
+        move_stack.append(("null", state_snapshot))
 
+        # 턴 변경
+        self.turn = 'b' if self.turn == 'w' else 'w'
+
+        # 풀무브 넘버는 백에서 흑으로 넘어갈 때만 증가
+        if self.turn == 'w':
+            self.fullmove_number += 1
+
+        # Null move에서는 halfmove_clock 증가 (잡거나 폰 이동이 아니므로)
+        self.halfmove_clock += 1
+
+    def undo_null_move(self, move_stack):
+        """
+        Null move 취소: apply_null_move로 넘긴 턴을 원상복구
+        """
+        if not move_stack:
+            raise ValueError("undo_null_move 호출 시 move_stack이 비어있음")
+
+        move_type, state_snapshot = move_stack.pop()
+        if move_type != "null":
+            raise ValueError("마지막 수가 null move가 아님")
+
+        # 스냅샷 복원
+        self.turn = state_snapshot["turn"]
+        self.halfmove_clock = state_snapshot["halfmove_clock"]
+        self.fullmove_number = state_snapshot["fullmove_number"]
+        if "castle_rights" in state_snapshot and state_snapshot["castle_rights"] is not None:
+            self.castle_rights = state_snapshot["castle_rights"].copy()
+        if "en_passant" in state_snapshot:
+            self.en_passant = state_snapshot["en_passant"]
+    
+    def is_endgame(self) -> bool:
+        """
+        엔드게임 여부를 판정.
+        기준:
+        1. 양쪽 퀸이 모두 없거나
+        2. 한쪽만 퀸이 있지만, 다른 기물(룩, 비숍, 나이트, 폰)의 총 가치가 작음
+        """
+        # 기물 가치 기준 (퀸 제외)
+        PIECE_VALUES_SIMPLE = {
+            'P': 1,  # Pawn
+            'N': 3,  # Knight
+            'B': 3,  # Bishop
+            'R': 5   # Rook
+        }
+
+        white_queens = 0
+        black_queens = 0
+        white_minor_major_score = 0
+        black_minor_major_score = 0
+
+        for r in range(8):
+            for c in range(8):
+                piece = self.board[r][c]
+                if piece is None:
+                    continue
+
+                name = piece.name.upper()
+                if name == 'Q':
+                    if piece.side == 'w':
+                        white_queens += 1
+                    else:
+                        black_queens += 1
+                elif name in PIECE_VALUES_SIMPLE:
+                    if piece.side == 'w':
+                        white_minor_major_score += PIECE_VALUES_SIMPLE[name]
+                    else:
+                        black_minor_major_score += PIECE_VALUES_SIMPLE[name]
+
+        # 양쪽 퀸 없음
+        if white_queens == 0 and black_queens == 0:
+            return True
+
+        # 한쪽만 퀸 있고, 상대방 다른 기물 점수가 매우 낮음 (ex: 7점 이하)
+        if white_queens == 0 and black_minor_major_score <= 7:
+            return True
+        if black_queens == 0 and white_minor_major_score <= 7:
+            return True
+
+        return False
 # ---------------------
 # Improved evaluation
 # ---------------------
@@ -674,8 +740,8 @@ def evaluate_position(state: GameState, prev_score: Optional[float] = None) -> f
                 coop_score += (values[target.name]/values[piece.name] if side == 'w' else -values[target.name]/values[piece.name])
         state.turn = orig_turn
     # 가중치
-    score += mobility_score * 0.1002
-    score += coop_score * 0.2001
+    score += mobility_score * 0.10023
+    score += coop_score * 0.200125
 
     return score
 
@@ -694,9 +760,7 @@ TT_UPPER = 'UPPER'  # value is an upper bound (fail-low)
 FUT_MAX_GAIN = PIECE_VALUES.get('Q', 90)  # assume at most queen swing
 FUT_WINDOW = 150  # only apply when window is reasonably narrow (score units)
 
-# Feature flags for pruning modes (tune for performance)
-ENABLE_NULL_MOVE = False  # set True to enable NMP; default off to avoid overhead on this eval
-ENABLE_PVS = True
+NULL_MOVE_ENABLE=False
 
 def move_key_tuple(m):
     # create a hashable key for a move (from,to)
@@ -712,6 +776,7 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                pv_move: Optional[Tuple[Tuple[int,int],Tuple[int,int]]] = None,
                deadline: Optional[float] = None,
                budget: Optional[Dict[str, int]] = None):
+
     # --- 회계/노드 카운트 ---
     if budget is not None:
         budget['used'] = budget.get('used', 0) + 1
@@ -739,51 +804,46 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
         trans_table[key] = (depth, score, TT_EXACT, None)
         return score, None, nodes
 
-    # --- 기본 상태 ---
+    # --- 체크 상태 확인 ---
     node_in_check = state.is_in_check(state.turn)
 
-    # --- Null Move Pruning (aggressive, safe-guarded) ---
-    # 조건: 깊이 충분, 체크 아님, 넌-폰 자산 존재
-    def _has_non_pawn_material():
-        for rr in range(8):
-            for cc in range(8):
-                p = state.board[rr][cc]
-                if p is None:
-                    continue
-                if p.name not in ('K', 'P'):
-                    return True
-        return False
-
-    if ENABLE_NULL_MOVE and depth >= 3 and not node_in_check and _has_non_pawn_material():
-        # 선택적 감소치: 깊이에 따라 조금 더 크게
-        R = 2 if depth < 6 else 3
-        nm_stack = []
-        state.do_null_move(nm_stack)
+    # --- Null Move Pruning ---
+    NULL_REDUCTION = 2
+    if (NULL_MOVE_ENABLE
+        and depth >= NULL_REDUCTION + 1 
+        and not node_in_check 
+        and not pv_move
+        and not state.is_endgame()):
         try:
-            # null-window search around beta for fail-high detection
-            if maximizing:
-                na, nb = (beta - 1, beta)
+            state.apply_null_move(move_stack)
+            if not state.is_in_check(state.turn):  # null move 후 즉시 체크 확인
+                null_score, _, null_nodes = alpha_beta(
+                    state,
+                    depth - 1 - NULL_REDUCTION,
+                    -beta,
+                    -beta + 1,
+                    not maximizing,
+                    trans_table,
+                    [],
+                    0,
+                    ply + 1,
+                    killer_moves,
+                    history,
+                    pv_move=None,
+                    deadline=deadline,
+                    budget=budget
+                )
+                nodes += null_nodes
+                null_score = -null_score
+                state.undo_null_move(move_stack)
+
+                if null_score >= beta:
+                    return beta, None, nodes  # 안전하게 beta 반환
             else:
-                na, nb = (alpha, alpha + 1)
-            try_val, _bm, try_nodes = alpha_beta(
-                state, depth - 1 - R, na, nb, not maximizing,
-                trans_table, [], 0, ply + 1,
-                killer_moves, history,
-                pv_move=None, deadline=deadline, budget=budget
-            )
+                state.undo_null_move(move_stack)
         except SearchTimeout:
-            state.undo_null_move(nm_stack)
+            state.undo_null_move(move_stack)
             raise
-        finally:
-            state.undo_null_move(nm_stack)
-        nodes += try_nodes
-        # fail-high: prune
-        if maximizing:
-            if try_val >= beta:
-                return try_val, None, nodes
-        else:
-            if try_val <= alpha:
-                return try_val, None, nodes
 
     # --- 수 생성 ---
     moves = state.generate_all_moves()
@@ -803,13 +863,10 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
     def score_move(m):
         meta = m[2]
         score = 0.0
-        # PV 우선
         if pv_move and (m[0], m[1]) == pv_move:
             score += 1_000_000
-        # TT bestmove
         elif tt and len(tt) >= 4 and tt[3] and (m[0], m[1]) == (tt[3][0], tt[3][1]):
             score += 900_000
-        # 캡처/앙파상: MVV-LVA
         elif ('capture' in meta) or ('en_passant' in meta and meta['en_passant']):
             if meta.get('en_passant'):
                 score += 100
@@ -820,21 +877,18 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     score += values.get(victim.name, 0) * 100
                     if len(m) > 3:
                         score -= values.get(m[3].name, 0)
-        # 킬러
         elif killer_moves is not None and ply < len(killer_moves):
             mk = (m[0], m[1])
             if killer_moves[ply][0] and mk == killer_moves[ply][0]:
                 score += 8000
             elif killer_moves[ply][1] and mk == killer_moves[ply][1]:
                 score += 7000
-        # 히스토리
         if history is not None:
             hk = move_key_tuple(m)
             score += history.get(hk, 0.0)
-        # 캐슬 가점
         if meta.get('castle'):
             score += 5000
-        return -score  # 오름차순 정렬용
+        return -score
 
     moves.sort(key=score_move)
 
@@ -842,47 +896,26 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
     best_move = None
     moves_searched = 0
 
-    # 공통: Futility 여부 판단(현재 노드 기준)
-    # node_in_check already computed above
     allow_futility = (depth <= 2 and not node_in_check and (beta - alpha) < FUT_WINDOW)
     static_eval = evaluate_position(state) if allow_futility else None
 
-    # Late Move Pruning limits by depth (quiet moves only, not in check)
-    LMP_LIMITS = {1: 6, 2: 10}
-
     if maximizing:
-        value = alpha  # start from current lower bound to avoid sentinel leaks
+        value = -200000
         for i, m in enumerate(moves):
             meta = m[2]
-            # deadline 체크: 시간 초과 시 현재까지의 결과 반환
-            # if deadline is not None and time.perf_counter() >= deadline:
-            #     return value, best_move, nodes
-
-            # Futility: 캡처/프로모션/체크 주는 수 제외 후 컷
             if allow_futility and ('capture' not in meta) and (not meta.get('promotion', False)):
                 if not state.gives_check(m[0], m[1], meta):
                     if static_eval is not None and static_eval + FUT_MAX_GAIN <= alpha:
                         continue
-
             fr_r, fr_c = m[0]
             if state.board[fr_r][fr_c] is None:
                 continue
-
             moving_side = state.turn
             state.apply_move(m[0], m[1], meta, move_stack)
-            if state.is_in_check(moving_side):  # 자체 체크 수 제거
+            if state.is_in_check(moving_side):
                 state.undo_move(move_stack)
                 continue
-
-            # Late Move Pruning: skip very late quiet moves at shallow depth
-            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False)) and (not meta.get('castle'))
-            if (depth in LMP_LIMITS) and (not node_in_check) and is_quiet and i >= LMP_LIMITS[depth]:
-                state.undo_move(move_stack)
-                continue
-
             moves_searched += 1
-
-            # --- 동적 LMR ---
             do_full = True
             is_quiet = ('capture' not in meta) and (not meta.get('promotion', False))
             is_pv = (pv_move is not None and i == 0)
@@ -891,7 +924,6 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                 if red > depth - 1:
                     red = depth - 1
                 reduced_depth = max(1, depth - 1 - red)
-
                 try:
                     score, _, lmr_nodes = alpha_beta(
                         state, reduced_depth, alpha, beta, False,
@@ -903,57 +935,29 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     state.undo_move(move_stack)
                     raise
                 nodes += lmr_nodes
-
-                # LMR 결과가 유망하면 full search
                 if score > alpha:
                     do_full = True
                 else:
                     do_full = False
-
             if do_full:
                 try:
-                    if i == 0 or not ENABLE_PVS:
-                        score, _, search_nodes = alpha_beta(
-                            state, depth - 1, alpha, beta, False,
-                            trans_table, [], 0, ply + 1,
-                            killer_moves, history,
-                            pv_move=(pv_move if i == 0 else None),
-                            deadline=deadline, budget=budget
-                        )
-                        nodes += search_nodes
-                    else:
-                        # PVS: try null-window first
-                        score, _, search_nodes = alpha_beta(
-                            state, depth - 1, alpha, alpha + 1, False,
-                            trans_table, [], 0, ply + 1,
-                            killer_moves, history,
-                            pv_move=None, deadline=deadline, budget=budget
-                        )
-                        nodes += search_nodes
-                        if score > alpha and score < beta:
-                            # re-search with full window
-                            score2, _, add_nodes = alpha_beta(
-                                state, depth - 1, alpha, beta, False,
-                                trans_table, [], 0, ply + 1,
-                                killer_moves, history,
-                                pv_move=None, deadline=deadline, budget=budget
-                            )
-                            nodes += add_nodes
-                            score = score2
+                    score, _, search_nodes = alpha_beta(
+                        state, depth - 1, alpha, beta, False,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=(pv_move if i == 0 else None),
+                        deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
-
+                nodes += search_nodes
             state.undo_move(move_stack)
-
-            # 알파 갱신
             if score > value:
                 value = score
                 best_move = (m[0], m[1], meta)
             if value > alpha:
                 alpha = value
-
-            # 베타 컷 + 킬러/히스토리 업데이트
             if alpha >= beta:
                 if is_quiet and killer_moves is not None and ply < len(killer_moves):
                     mk = (m[0], m[1])
@@ -964,40 +968,23 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     hk = move_key_tuple(m)
                     history[hk] = history.get(hk, 0.0) + (depth * depth)
                 break
-
     else:
-        value = beta  # start from current upper bound to avoid sentinel leaks
+        value = 200000
         for i, m in enumerate(moves):
             meta = m[2]
-            # # deadline 체크: 시간 초과 시 현재까지의 결과 반환
-            # if deadline is not None and time.perf_counter() >= deadline:
-            #     return value, best_move, nodes
-
-            # Futility (min)
             if allow_futility and ('capture' not in meta) and (not meta.get('promotion', False)):
                 if not state.gives_check(m[0], m[1], meta):
                     if static_eval is not None and static_eval - FUT_MAX_GAIN >= beta:
                         continue
-
             fr_r, fr_c = m[0]
             if state.board[fr_r][fr_c] is None:
                 continue
-
             moving_side = state.turn
             state.apply_move(m[0], m[1], meta, move_stack)
             if state.is_in_check(moving_side):
                 state.undo_move(move_stack)
                 continue
-
-            # Late Move Pruning: skip very late quiet moves at shallow depth
-            is_quiet = ('capture' not in meta) and (not meta.get('promotion', False)) and (not meta.get('castle'))
-            if (depth in LMP_LIMITS) and (not node_in_check) and is_quiet and i >= LMP_LIMITS[depth]:
-                state.undo_move(move_stack)
-                continue
-
             moves_searched += 1
-
-            # --- 동적 LMR ---
             do_full = True
             is_quiet = ('capture' not in meta) and (not meta.get('promotion', False))
             is_pv = (pv_move is not None and i == 0)
@@ -1006,7 +993,6 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                 if red > depth - 1:
                     red = depth - 1
                 reduced_depth = max(1, depth - 1 - red)
-
                 try:
                     score, _, lmr_nodes = alpha_beta(
                         state, reduced_depth, alpha, beta, True,
@@ -1018,56 +1004,29 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     state.undo_move(move_stack)
                     raise
                 nodes += lmr_nodes
-
-                # LMR 결과가 유망하면 full search
                 if score < beta:
                     do_full = True
                 else:
                     do_full = False
-
             if do_full:
                 try:
-                    if i == 0 or not ENABLE_PVS:
-                        score, _, search_nodes = alpha_beta(
-                            state, depth - 1, alpha, beta, True,
-                            trans_table, [], 0, ply + 1,
-                            killer_moves, history,
-                            pv_move=(pv_move if i == 0 else None),
-                            deadline=deadline, budget=budget
-                        )
-                        nodes += search_nodes
-                    else:
-                        # PVS for minimizing: try (beta-1, beta) window
-                        score, _, search_nodes = alpha_beta(
-                            state, depth - 1, beta - 1, beta, True,
-                            trans_table, [], 0, ply + 1,
-                            killer_moves, history,
-                            pv_move=None, deadline=deadline, budget=budget
-                        )
-                        nodes += search_nodes
-                        if score < beta and score > alpha:
-                            score2, _, add_nodes = alpha_beta(
-                                state, depth - 1, alpha, beta, True,
-                                trans_table, [], 0, ply + 1,
-                                killer_moves, history,
-                                pv_move=None, deadline=deadline, budget=budget
-                            )
-                            nodes += add_nodes
-                            score = score2
+                    score, _, search_nodes = alpha_beta(
+                        state, depth - 1, alpha, beta, True,
+                        trans_table, [], 0, ply + 1,
+                        killer_moves, history,
+                        pv_move=(pv_move if i == 0 else None),
+                        deadline=deadline, budget=budget
+                    )
                 except SearchTimeout:
                     state.undo_move(move_stack)
                     raise
-
+                nodes += search_nodes
             state.undo_move(move_stack)
-
-            # 베타 갱신
             if score < value:
                 value = score
                 best_move = (m[0], m[1], meta)
             if value < beta:
                 beta = value
-
-            # 알파베타 컷 + 킬러/히스토리
             if alpha >= beta:
                 if is_quiet and killer_moves is not None and ply < len(killer_moves):
                     mk = (m[0], m[1])
@@ -1079,22 +1038,21 @@ def alpha_beta(state: GameState, depth: int, alpha: float, beta: float, maximizi
                     history[hk] = history.get(hk, 0.0) + (depth * depth)
                 break
 
-    # --- 모든 수가 잘려 실제 하위 탐색이 없었을 때: 값 역류 방지용 리턴 ---
-    # 모든 수가 LMP/Futility 등으로 컷되어 실제 탐색을 수행하지 않았다면,
-    # 센티넬 값 대신 현재 창 경계를 반환해 상위에서 창이 확장되지 않도록 한다.
+    # --- 모든 수가 잘려 실제 하위 탐색이 없었을 때 ---
     if moves_searched == 0:
-        return (alpha if maximizing else beta), None, nodes
+        if state.turn == 'w':
+            return -500000, None, nodes
+        else:
+            return 500000, None, nodes
 
-    # --- TT 저장 (경계 플래그) ---
-    value_final = value
-
-    if value <= alpha_orig:
+    # --- TT 저장 ---
+    value_final = alpha if maximizing else beta
+    if value_final <= alpha_orig:
         bound = TT_UPPER
-    elif value >= beta_orig:
+    elif value_final >= beta_orig:
         bound = TT_LOWER
     else:
         bound = TT_EXACT
-
     trans_table[key] = (depth, value_final, bound, (best_move[0], best_move[1]) if best_move else None)
     return value_final, best_move, nodes
 
@@ -1121,10 +1079,6 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
     pv_move: Optional[Tuple[Tuple[int,int],Tuple[int,int]]] = None
     last_top_moves: Optional[list] = None
 
-    # Timing/model history for depth scheduling
-    depth_time_hist: List[float] = []  # seconds per completed depth
-    nodes_hist: List[int] = []         # nodes added per completed depth
-
     def _compute_top_moves(k: int = 5):
         moves = state.generate_all_moves()
         scored = []
@@ -1145,31 +1099,13 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
 
     # Time deadline
     deadline = time.perf_counter() + max(0.0, max_time)
-    # Allow up to ~25% overtime for deeper search if helpful
-    allowed_deadline = deadline + (0.25 * max(0.0, max_time))
 
     depth = start_depth
     while True:
-        # Time check + predictive scheduling before starting next depth
+        # Time check before starting next depth
         elapsed = time.time() - start_time
-        remaining = max(0.0, (deadline - time.perf_counter()))
-        allowed_remaining = max(0.0, (allowed_deadline - time.perf_counter()))
-        if allowed_remaining <= 0:
+        if time.perf_counter() >= deadline:
             break
-        # If we have timing history, estimate cost of this depth and next depth; stop if likely to exceed
-        if depth_time_hist:
-            if len(depth_time_hist) >= 2:
-                growth = depth_time_hist[-1] / max(1e-6, depth_time_hist[-2])
-            elif len(nodes_hist) >= 2 and nodes_hist[-2] > 0:
-                growth = nodes_hist[-1] / max(1e-6, nodes_hist[-2])
-            else:
-                growth = 2.0
-            # clamp to reasonable bounds
-            growth = min(4.0, max(1.2, float(growth)))
-            predicted_time_for_next = depth_time_hist[-1] * growth
-            # If predicted time likely exceeds extended budget, skip starting a new depth
-            if predicted_time_for_next > allowed_remaining * 0.9:
-                break
 
         # Depth start event
         if callable(progress):
@@ -1188,7 +1124,6 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                 pass
 
         depth_start_ts = time.perf_counter()
-        nodes_before_depth = nodes_total
 
         # Root-level loop with per-move updates (MP-like)
         root_moves = state.generate_all_moves()
@@ -1210,16 +1145,8 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
         try:
             for m in ordered:
                 # Time check before each child
-                # # Predictive early-abort: estimate remaining child time; if likely to exceed extended deadline, abort this depth
-                # if allowed_deadline is not None:
-                #     i = len(root_results)
-                #     if i > 0:
-                #         elapsed_depth = time.perf_counter() - depth_start_ts
-                #         avg_per_child = elapsed_depth / max(1, i)
-                #         remaining_children = max(0, len(ordered) - i)
-                #         est_remaining = avg_per_child * remaining_children
-                #         if (time.perf_counter() + est_remaining) > allowed_deadline:
-                #             raise SearchTimeout()
+                # if time.perf_counter() >= deadline:
+                #     raise SearchTimeout()
 
                 fr, to, meta = m[0], m[1], m[2]
 
@@ -1294,14 +1221,6 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                 last_completed_depth = depth
                 pv_move = (best_move[0], best_move[1])
 
-            # Record depth timing and nodes for scheduling model
-            try:
-                depth_time_measured = max(0.0, time.perf_counter() - depth_start_ts)
-                depth_time_hist.append(float(depth_time_measured))
-                nodes_hist.append(max(0, int(nodes_total - nodes_before_depth)))
-            except Exception:
-                pass
-
             # Emit depth_complete with final top list
             if callable(progress):
                 try:
@@ -1331,14 +1250,10 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                     pass
 
         except SearchTimeout:
-            # On timeout, prefer current iteration partial best move/value if any
-            if local_best_move is not None:
-                best_move = local_best_move
-                best_val = local_best_val
             # Partial results: emit timeout + depth_complete with what we have
             if callable(progress):
                 try:
-                    reason = 'time' if time.perf_counter() >= allowed_deadline else 'node_budget'
+                    reason = 'time' if time.perf_counter() >= deadline else 'node_budget'
                     # Emit a timeout event with current best and partial top_moves
                     sorted_partial = sorted(
                         root_results,
@@ -1350,14 +1265,7 @@ def iterative_deepening_search(state: GameState, max_time: float = 2.0, start_de
                         for (mm, vv, _nn) in sorted_partial
                     ]
                     last_top_moves = top_moves
-                    progress({
-                        'event': 'timeout',
-                        'depth': depth,
-                        'reason': reason,
-                        'best_move': best_move,
-                        'best_val': best_val,
-                        'top_moves': top_moves
-                    })
+                    progress({'event': 'timeout', 'depth': depth, 'reason': reason, 'top_moves': top_moves})
                 except Exception:
                     pass
             break
