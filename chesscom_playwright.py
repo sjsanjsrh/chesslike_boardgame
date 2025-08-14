@@ -1012,7 +1012,7 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                 top_k=5,
                 prevent_overrun=prevent_overrun_flag,
                 root_early_abort=root_early_abort_flag,
-                overrun_budget=0.6,
+                overrun_budget=overrun_budget_cfg,
             )
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
@@ -1361,8 +1361,14 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                 _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
                             except Exception:
                                 pass
+                            # overrun budget from UI for auto-detect path
+                            try:
+                                overrun_budget = float(cfg.get('overrunBudget')) if cfg.get('overrunBudget') is not None else 0.6
+                            except Exception:
+                                overrun_budget = 0.6
                             worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True,
-                                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort)
+                                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort,
+                                           overrun_budget=overrun_budget)
                             active_job = True
                             active_want_click = True
                 else:
@@ -1405,8 +1411,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                    f"<div style='height:100%;width:{pct:.1f}%;background:#4CAF50;'></div></div>")
                             lines.append(bar)
                         _overlay_set(page, ''.join(lines))
-                        if show_vectors:
-                            _vector_set(page, _build_arrows_from_top_moves(tm or []))
+                        if show_vectors and isinstance(tm, list) and len(tm) > 0:
+                            _vector_set(page, _build_arrows_from_top_moves(tm))
                     except Exception:
                         pass
                 elif et == 'result':
@@ -1429,6 +1435,13 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                 f"<div>eval={disp_val}</div>",
                             ]
                             _overlay_set(page, ''.join(final_lines))
+                            try:
+                                if show_vectors:
+                                    _vector_set(page, _build_arrows_from_top_moves([
+                                        {'from': res_move[0], 'to': res_move[1], 'val': disp_val if isinstance(disp_val, (int, float)) else 0.0}
+                                    ]))
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     # Optional click without waiting for reflection

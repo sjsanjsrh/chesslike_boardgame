@@ -18,7 +18,17 @@ def _evaluate_child_position(args):
 
     # Apply the root move on the copied state
     move_stack = []
+    # Remember mover to verify self-check after move
+    mover = state_copy.turn
     state_copy.apply_move(move[0], move[1], move[2], move_stack)
+    # Legality guard: if move leaves own king in check, return a losing score
+    try:
+        from alphabeta import MATE_VALUE as _MATE_VALUE
+        if state_copy.is_in_check(mover):
+            bad_val = (-_MATE_VALUE) if mover == 'w' else (_MATE_VALUE)
+            return move, bad_val, 0, target_depth
+    except Exception:
+        pass
 
     # Fixed-depth alpha-beta from the child position
     # Import locally to avoid potential pickling issues
@@ -70,6 +80,26 @@ def get_multiprocess_move(
     except Exception:
         pass
     moves = state.generate_all_moves()
+    # Filter out illegal root moves (leave own king in check)
+    try:
+        legal = []
+        move_stack = []
+        mover = state.turn
+        for m in list(moves):
+            fr, to, meta = m[0], m[1], m[2]
+            # Skip stale origin squares
+            fr_r, fr_c = fr
+            if state.board[fr_r][fr_c] is None:
+                continue
+            state.apply_move(fr, to, meta, move_stack)
+            try:
+                if not state.is_in_check(mover):
+                    legal.append(m)
+            finally:
+                state.undo_move(move_stack)
+        moves = legal
+    except Exception:
+        pass
     if not moves:
         return None, 0, 0, 0
 
@@ -168,20 +198,14 @@ def get_multiprocess_move(
 
                 # poll futures periodically for timely updates
                 pending = set(futures)
-                # If overrun is allowed, wait until allowed_end; otherwise, stop at deadline
-                while pending and time.time() < (allowed_end if not prevent_overrun else deadline):
-                    horizon = (allowed_end if not prevent_overrun else deadline)
-                    slice_deadline = min(0.2, max(0.0, horizon - time.time()))
-                    if slice_deadline <= 0:
-                        break
-                    done, pending = wait(pending, timeout=slice_deadline)
-                    # collect finished
+                # 정책 변경: 현재 깊이에 진입했으면 항상 완주(중간 취소 없음)
+                while pending:
+                    done, pending = wait(pending, timeout=0.2)
                     for fut in done:
                         try:
                             move, val, nodes, d_done = fut.result()
                             nodes_total += int(nodes or 0)
                             round_results.append((move, val, nodes, d_done))
-                            # update best
                             if best_so_far is None:
                                 best_so_far = (move, val)
                             else:
@@ -191,8 +215,6 @@ def get_multiprocess_move(
                                     best_so_far = (move, val)
                         except Exception:
                             pass
-
-                    # emit progress update every slice
                     now = time.time()
                     top_moves = _top_from_results(round_results, top_k)
                     _emit({
@@ -207,13 +229,7 @@ def get_multiprocess_move(
                         'top_moves': top_moves,
                     })
 
-                # cancel remaining if we ran out of allowance; otherwise we finished fully
-                if pending:
-                    for fut in pending:
-                        try:
-                            fut.cancel()
-                        except Exception:
-                            pass
+                # 중간 취소 없음: pending이 비어야 여기 도달
 
                 if round_results and len(round_results) == len(ordered):
                     # 라운드 완주
